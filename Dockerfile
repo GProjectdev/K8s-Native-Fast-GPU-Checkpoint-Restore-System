@@ -26,4 +26,6 @@ RUN curl -sSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${
 
 COPY --from=gobuild /out/node-agent /usr/local/bin/node-agent
 # Interceptor artifacts shipped to the node by the agent at startup.
-COP
+COPY --from=ccbuild /icpt/libgcr-interceptor.so /opt/gpu-cr-dist/libgcr-interceptor.so
+
+ENTRYPOINT ["/usr/local/bin/node-agent"]
