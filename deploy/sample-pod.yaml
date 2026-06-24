@@ -1,0 +1,35 @@
+# Example GPU Pod wired for GCR selective interception.
+# Mirrors the "Pod example" in the DCN Progress Report: the workload LD_PRELOADs
+# the interceptor shim from the host-installed library directory.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-gcr-pod
+  namespace: default
+  labels:
+    app: vllm-gcr
+spec:
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:latest
+      args: ["--model", "facebook/opt-1.3b"]
+      env:
+        # Load the selective CUDA interceptor before the CUDA runtime.
+        - name: LD_PRELOAD
+          value: /opt/gpu-cr/libgcr-interceptor.so
+        # Directory that contains libgcr-interceptor.so and the GCR hook libcuda.so.
+        - name: GCR_HOME
+          value: /opt/gpu-cr
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: gpu-cr-lib
+          mountPath: /opt/gpu-cr
+          readOnly: true
+  volumes:
+    # Provided by the Node Agent (it installs the library into /var/lib/gpu-cr/lib).
+    - name: gpu-cr-lib
+      hostPath:
+        path: /var/lib/gpu-cr/lib
+        type: Directory

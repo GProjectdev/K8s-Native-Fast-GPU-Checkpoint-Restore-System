@@ -1,0 +1,118 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gpucheckpoints.gpu-cr.io
+spec:
+  group: gpu-cr.io
+  names:
+    kind: GPUCheckpoint
+    listKind: GPUCheckpointList
+    plural: gpucheckpoints
+    singular: gpucheckpoint
+    shortNames:
+      - gpuckpt
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Pod
+          type: string
+          jsonPath: .spec.podRef.name
+        - name: Node
+          type: string
+          jsonPath: .status.observedNode
+        - name: Period
+          type: string
+          jsonPath: .spec.period
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Count
+          type: integer
+          jsonPath: .status.checkpointCount
+        - name: Last
+          type: date
+          jsonPath: .status.lastCheckpointTime
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [podRef, storage]
+              properties:
+                podRef:
+                  type: object
+                  required: [namespace, name]
+                  properties:
+                    namespace:
+                      type: string
+                    name:
+                      type: string
+                    container:
+                      type: string
+                    nodeName:
+                      type: string
+                storage:
+                  type: object
+                  required: [path]
+                  properties:
+                    type:
+                      type: string
+                      enum: [hostPath, nfs, s3]
+                      default: hostPath
+                    path:
+                      type: string
+                    endpoint:
+                      type: string
+                period:
+                  type: string
+                  description: >-
+                    Checkpoint interval as a fixed-width HHMMSS string
+                    (e.g. "000500" = every 5 min). Empty or "000000" = one-shot.
+                  pattern: '^[0-9]{6}$'
+                incremental:
+                  type: boolean
+                  default: false
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                observedNode:
+                  type: string
+                lastCheckpointTime:
+                  type: string
+                  format: date-time
+                checkpointCount:
+                  type: integer
+                  format: int64
+                lastCheckpointPath:
+                  type: string
+                message:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status, lastTransitionTime, reason]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string

@@ -1,0 +1,15 @@
+# Go build artifacts
+bin/
+*.o
+*.so
+*.test
+*.out
+vendor/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log

@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-cr-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-cr-node-agent
+  namespace: gpu-cr-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpu-cr-node-agent
+rules:
+  # Watch/update the GPUCheckpoint CRs.
+  - apiGroups: ["gpu-cr.io"]
+    resources: ["gpucheckpoints"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["gpu-cr.io"]
+    resources: ["gpucheckpoints/status"]
+    verbs: ["get", "update", "patch"]
+  # Resolve target Pods and their node placement.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Call the kubelet checkpoint API (POST /checkpoint/{ns}/{pod}/{ctr}).
+  - apiGroups: [""]
+    resources: ["nodes/proxy", "nodes/checkpoint"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-cr-node-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-cr-node-agent
+subjects:
+  - kind: ServiceAccount
+    name: gpu-cr-node-agent
+    namespace: gpu-cr-system
