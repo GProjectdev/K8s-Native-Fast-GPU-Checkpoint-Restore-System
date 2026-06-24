@@ -190,77 +190,67 @@ volumes:
 
 ---
 
-## 빠른 시작
+## 사전 준비 / 서버 설정
 
-사전 요구사항: `ContainerCheckpoint` 기능이 있는 쿠버네티스 클러스터(v1.30+ 권장),
-NVIDIA 드라이버 ≥ 550 (`cuda-checkpoint`), GPU 노드에 GCR hook 드라이버 준비. GPU가
-없는 클러스터에서는 `--dry-run=true`로 제어 흐름만 점검할 수 있습니다.
+이 시스템을 실제로 실행·테스트하려면 GPU 노드, 컨테이너 런타임, 쿠버네티스
+클러스터를 미리 준비해야 합니다. 아래는 전체 목록이며, 순수 제어 흐름만 점검할
+때는 GPU/CRIU 부분을 건너뛰고 에이전트를 `--dry-run=true`로 실행하면 됩니다.
 
-이미지 빌드는 **Buildah**를 사용합니다(데몬 불필요, 루트리스 가능). `Dockerfile`은
-Buildah의 `Containerfile`로 그대로 사용됩니다.
+### 1. 하드웨어
 
-```bash
-# 1. 인터셉터 shim 빌드
-make -C interceptor
+| 항목 | 요구사항 |
+|------|----------|
+| GPU | 드라이버 ≥ 550이 지원하는 NVIDIA GPU (논문/Progress Report는 A100-40GB 사용). |
+| 호스트 RAM | 체크포인트 백엔드가 **CPU 메모리**이므로, 스냅샷할 GPU 메모리 이상 확보 (예: A100-40GB 워크로드면 ≥ 40 GB) + 여유분. |
+| 디스크 | `Checkpoint.tar` 저장 경로의 여유 공간 (LLM은 체크포인트당 수십 GB). |
 
-# 2. Go 의존성 해석 및 에이전트 빌드
-go mod tidy
-go build ./...
-
-# 3. Buildah로 에이전트 이미지 빌드 & 푸시
-#    (필요 시 먼저 로그인: buildah login ghcr.io)
-buildah bud -f Dockerfile -t ghcr.io/gprojectdev/gpu-cr-node-agent:latest .
-buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
-  docker://ghcr.io/gprojectdev/gpu-cr-node-agent:latest
-
-# 4. 클러스터에 설치
-kubectl apply -f config/crd/gpu-cr.io_gpucheckpoints.yaml
-kubectl apply -f deploy/rbac.yaml
-kubectl apply -f deploy/daemonset.yaml
-
-# 5. GPU Pod 실행 및 체크포인트 요청
-kubectl apply -f deploy/sample-pod.yaml
-kubectl apply -f deploy/sample-gpucheckpoint.yaml
-
-# 6. 확인
-kubectl get gpucheckpoints
-# NAME            POD            NODE        PERIOD   PHASE       COUNT   LAST
-# ckpt-vllm-001   vllm-gcr-pod   gpu-node-1  000500   Completed   3       30s
-```
-
-### Buildah 참고
-
-- `buildah bud`는 `buildah build`의 별칭으로, `Dockerfile`/`Containerfile`을 그대로
-  읽습니다. (`-f Dockerfile` 생략 시 현재 디렉토리의 `Containerfile` →
-  `Dockerfile` 순으로 탐색)
-- 루트리스로 빌드하려면 `buildah unshare` 컨텍스트나 적절한 subuid/subgid 설정이
-  필요할 수 있습니다.
-- 레지스트리 인증: `buildah login ghcr.io` 실행 후 사용자명/토큰 입력.
-- 멀티 아키텍처가 필요하면 `buildah bud --platform=linux/amd64` 등으로 지정합니다.
-- 빌드 결과를 로컬 컨테이너 스토리지에서 확인: `buildah images`.
-
----
-
-## 개발
+### 2. GPU 노드 OS 패키지
 
 ```bash
-go test ./...            # 단위 테스트 (period 파싱 등)
-go vet ./...
-make -C interceptor      # libgcr-interceptor.so 빌드
+# NVIDIA 드라이버 >= 550 — 제어 상태 C/R에 쓰는 cuda-checkpoint 바이너리 포함
+nvidia-smi                       # 드라이버 >= 550.x
+which cuda-checkpoint            # 존재해야 함 (보통 /usr/bin/cuda-checkpoint)
+cuda-checkpoint --help
+
+# CRIU >= 3.17 — kubelet/CRI 컨테이너 체크포인트가 CPU 측 상태 저장에 사용
+sudo apt-get install -y criu     # 또는 소스 빌드
+criu --version
+sudo criu check                  # "Looks good." 가 떠야 함
+
+# NVIDIA Container Toolkit — 컨테이너에 GPU 노출
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+nvidia-ctk --version
 ```
 
-에이전트의 `--dry-run=true` 모드는 권한이 필요한 호스트 작업
-(`cuda-checkpoint`, kubelet API, crictl)을 건너뛰면서도 reconcile, 상태 갱신,
-스토리지 레이아웃은 그대로 실행합니다. 로컬/kind 클러스터에 유용합니다.
+> 실제 선택적 `cuMem*` 인터셉션을 수행하는 **GCR hook 드라이버**(`libcuda.so`)는
+> 본 저장소에 포함되지 않습니다. 업스트림
+> [`thustorage/GCR`](https://github.com/thustorage/GCR)(`GCR/build.sh`)에서 빌드한
+> 뒤, 각 GPU 노드의 `/var/lib/gpu-cr/lib/`에 (에이전트가 설치하는
+> `libgcr-interceptor.so` 옆에) `libcuda.so`를 배치하세요. 없으면 shim이 실제
+> 드라이버로 폴백하여 GPU 측 C/R이 동작하지 않습니다.
 
----
+### 3. 체크포인트를 지원하는 컨테이너 런타임
 
-## 로드맵
+**containerd ≥ 1.7** 또는 CRIU 지원으로 빌드된 **CRI-O ≥ 1.25**를 사용하세요.
 
-DCN Progress Report의 세 가지 질문을 따릅니다.
+```bash
+# containerd: 에이전트가 사용할 CRI 소켓 확인
+ls -l /run/containerd/containerd.sock
+# CRI-O 사용 시: /run/crio/crio.sock  (DaemonSet의 hostPath를 맞게 수정)
+```
 
-1. **GCR의 K8s 통합** — `GPUCheckpoint` CR + CR을 직접 watch하는 Node Agent(별도
-   컨트롤러 없음) *(현재 단계)*; custom container runtime 기반 복원 경로 *(다음)*.
-2. **PhOS 동시 체크포인팅** — Copy-on-Write 데이터버퍼 체크포인트 후 제어 상태
-   체크포인트.
-3. **CRIUgpu 통합** — 
+### 4. 쿠버네티스 클러스터 구성
+
+```text
+# 쿠버네티스 v1.30+ 권장.
+# kubelet 과 kube-apiserver 양쪽에서 ContainerCheckpoint feature gate 활성화
+# (1.30에서 beta; 이전 버전은 명시적으로 켜야 함):
+#   --feature-gates=ContainerCheckpoint=true
+```
+
+- **NVIDIA device plugin**(가능하면 GPU Feature Discovery도) — Pod가
+  `nvidia.com/gpu`를 요청할 수 있고, 노드에 DaemonSet이 셀렉트하는
+  `nvidia.com/gpu.present=true` 라벨이 붙도록:
+  ```bash
+  kubectl get nodes -L nvidia.com/gpu.present
+  kubectl describe node <gpu
