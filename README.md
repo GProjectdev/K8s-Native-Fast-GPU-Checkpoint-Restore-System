@@ -10,6 +10,8 @@ transparently, on a schedule, without modifying the workload.
 > path). The GPU C/R Controller and the restore path (custom container runtime)
 > are planned in later phases (see [Roadmap](#roadmap)).
 
+> 🇰🇷 한국어 문서: [`README.ko.md`](README.ko.md)
+
 This work is based on:
 
 - Paper: *GPU Checkpoint/Restore Made Fast and Lightweight* (Zeng et al., Tsinghua University, FAST '26)
@@ -184,8 +186,8 @@ volumes:
 ├── interceptor/                   # LD_PRELOAD shim (preload.c) + Makefile
 ├── config/crd/                    # CustomResourceDefinition
 ├── deploy/                        # rbac, daemonset, sample Pod, sample CR
-├── Dockerfile                     # builds agent + shim image
-└── README.md
+├── Dockerfile                     # builds agent + shim image (Buildah/Containerfile compatible)
+└── README.md / README.ko.md
 ```
 
 ---
@@ -205,9 +207,11 @@ make -C interceptor
 go mod tidy
 go build ./...
 
-# 3. Build & push the agent image
-docker build -t ghcr.io/gprojectdev/gpu-cr-node-agent:latest .
-docker push ghcr.io/gprojectdev/gpu-cr-node-agent:latest
+# 3. Build & push the agent image with Buildah
+buildah bud -f Dockerfile -t ghcr.io/gprojectdev/gpu-cr-node-agent:latest .
+buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
+  docker://ghcr.io/gprojectdev/gpu-cr-node-agent:latest
+# (login first if needed: buildah login ghcr.io)
 
 # 4. Install into the cluster
 kubectl apply -f config/crd/gpu-cr.io_gpucheckpoints.yaml
@@ -257,7 +261,4 @@ Restore Pod annotation handled by a custom CRI-O/runtime.
 
 ## Acknowledgements
 
-GCR design and upstream code by Shaoxun Zeng, Tingxu Ren, Jiwu Shu, and Youyou Lu
-(Tsinghua University), FAST '26. This repository is an independent Kubernetes
-integration developed at the Distributed Cloud and Network Research Laboratory
-(DCN Lab).
+GCR d
