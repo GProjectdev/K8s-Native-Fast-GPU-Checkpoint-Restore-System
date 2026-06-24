@@ -199,6 +199,9 @@ volumes:
 
 ## Prerequisites & Server Setup
 
+> 📖 **Step-by-step install guide (Master + Worker, copy-paste commands):**
+> [`docs/SETUP.md`](docs/SETUP.md) · 한국어 [`docs/SETUP.ko.md`](docs/SETUP.ko.md)
+
 To actually run and test this system you need to prepare the GPU nodes, the
 container runtime, and the Kubernetes cluster up front. The list below is the
 full set; for a pure control-flow smoke test you can skip the GPU/CRIU pieces and
@@ -232,6 +235,4 @@ nvidia-ctk --version
 
 > The **GCR hook driver** (`libcuda.so`) that performs the actual selective
 > `cuMem*` interception is **not** part of this repo. Build it from upstream
-> [`thustorage/GCR`](https://github.com/thustorage/GCR) (`GCR/build.sh`) and place
-> the resulting `libcuda.so` into `/var/lib/gpu-cr/lib/` on each GPU node, next to
-> the `libgcr-inte
+> [`thustorage/GCR

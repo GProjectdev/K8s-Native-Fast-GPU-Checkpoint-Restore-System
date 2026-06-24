@@ -192,6 +192,9 @@ volumes:
 
 ## 사전 준비 / 서버 설정
 
+> 📖 **단계별 설치 가이드 (Master + Worker, 복붙 명령어):**
+> [`docs/SETUP.ko.md`](docs/SETUP.ko.md) · English [`docs/SETUP.md`](docs/SETUP.md)
+
 이 시스템을 실제로 실행·테스트하려면 GPU 노드, 컨테이너 런타임, 쿠버네티스
 클러스터를 미리 준비해야 합니다. 아래는 전체 목록이며, 순수 제어 흐름만 점검할
 때는 GPU/CRIU 부분을 건너뛰고 에이전트를 `--dry-run=true`로 실행하면 됩니다.
@@ -249,8 +252,4 @@ ls -l /run/containerd/containerd.sock
 ```
 
 - **NVIDIA device plugin**(가능하면 GPU Feature Discovery도) — Pod가
-  `nvidia.com/gpu`를 요청할 수 있고, 노드에 DaemonSet이 셀렉트하는
-  `nvidia.com/gpu.present=true` 라벨이 붙도록:
-  ```bash
-  kubectl get nodes -L nvidia.com/gpu.present
-  kubectl describe node <gpu
+  `nvidia.com/gpu`를 요청할 수 있고, 노드에 Daemo
