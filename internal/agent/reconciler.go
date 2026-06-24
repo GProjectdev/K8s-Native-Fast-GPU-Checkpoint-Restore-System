@@ -162,4 +162,8 @@ func setCondition(status *gpucrv1alpha1.GPUCheckpointStatus, condType string, s 
 }
 
 // SetupWithManager registers the reconciler with the controller manager.
-func (r *Reconciler) SetupWithManag
+func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&gpucrv1alpha1.GPUCheckpoint{}).
+		Complete(r)
+}

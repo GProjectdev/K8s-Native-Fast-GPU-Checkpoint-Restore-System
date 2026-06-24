@@ -143,4 +143,8 @@ type GPUCheckpoint struct {
 // +kubebuilder:object:root=true
 
 // GPUCheckpointList contains a list of GPUCheckpoint.
-type GPUChec
+type GPUCheckpointList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []GPUCheckpoint `json:"items"`
+}
