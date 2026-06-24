@@ -17,3 +17,4 @@ spec:
   # Checkpoint every 5 minutes (HHMMSS). Use "000000" (or omit) for one-shot.
   period: "000500"
   # Take only dirty buffers after the first checkpoint (GCR shadow execution).
+  incremental: true

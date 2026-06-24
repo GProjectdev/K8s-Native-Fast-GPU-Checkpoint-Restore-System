@@ -252,4 +252,136 @@ ls -l /run/containerd/containerd.sock
 ```
 
 - **NVIDIA device plugin**(가능하면 GPU Feature Discovery도) — Pod가
-  `nvidia.com/gpu`를 요청할 수 있고, 노드에 Daemo
+  `nvidia.com/gpu`를 요청할 수 있고, 노드에 DaemonSet이 셀렉트하는
+  `nvidia.com/gpu.present=true` 라벨이 붙도록:
+  ```bash
+  kubectl get nodes -L nvidia.com/gpu.present
+  kubectl describe node <gpu-node> | grep nvidia.com/gpu
+  ```
+- **PodSecurity**: 에이전트는 `privileged`, `hostPID`, `hostNetwork`로 실행됩니다.
+  네임스페이스에 라벨을 부여해 허용하세요:
+  ```bash
+  kubectl label ns gpu-cr-system pod-security.kubernetes.io/enforce=privileged
+  ```
+- **kubelet 체크포인트 API 접근**: 에이전트 ServiceAccount에 `deploy/rbac.yaml`로
+  `nodes/checkpoint` + `nodes/proxy` 권한이 부여됩니다. kubelet이 `:10250`에서
+  동작하고 authn/authz(webhook)가 켜져 있는지 확인하세요 (kubeadm 클러스터는 기본).
+
+### 5. 빌드 / 레지스트리 도구 (빌드 호스트)
+
+```bash
+go version          # 1.22+
+gcc --version ; make --version
+buildah --version   # Docker 대신 이미지 빌드에 사용
+# 푸시 가능하고 노드에서 pull 가능한 이미지 레지스트리 (예: ghcr.io)
+buildah login ghcr.io
+```
+
+### 6. 사전 점검 (GPU 노드에서 실행)
+
+```bash
+nvidia-smi -L                                   # GPU 인식
+cuda-checkpoint --help                          # 드라이버 C/R 사용 가능
+sudo criu check                                 # CRIU 정상
+ls /run/containerd/containerd.sock              # CRI 소켓 존재
+kubectl version --short                         # 서버 >= v1.30
+kubectl get --raw /api/v1/nodes/$(hostname)/proxy/checkpoint/ 2>&1 | head  # 엔드포인트 도달 (403/POST 요구 = 정상)
+ls /var/lib/gpu-cr/lib/libcuda.so               # GCR hook 드라이버 배치됨 (2단계 후)
+```
+
+GPU/CRIU 항목이 빠져 있어도 `--dry-run=true`로 오케스트레이션은 검증할 수 있습니다
+(권한 필요한 호스트 작업은 수행하지 않음).
+
+### 단일 노드 vs 멀티 노드
+
+- **단일 노드 테스트**: `storage.type: hostPath`면 충분 (체크포인트가 노드에 남음).
+- **멀티 노드 / 마이그레이션 테스트**: 공유 스토리지(`type: nfs`, 모든 노드에 동일
+  경로 마운트)를 사용해, 한 노드에서 뜬 체크포인트를 복원 노드에서 접근 가능하게
+  하세요.
+
+---
+
+## 빠른 시작
+
+위 [사전 준비](#사전-준비--서버-설정)가 끝났다고 가정합니다. GPU가 없는
+클러스터에서는 `--dry-run=true`로 제어 흐름만 점검할 수 있습니다.
+
+이미지 빌드는 **Buildah**를 사용합니다(데몬 불필요, 루트리스 가능). `Dockerfile`은
+Buildah의 `Containerfile`로 그대로 사용됩니다.
+
+```bash
+# 1. 인터셉터 shim 빌드
+make -C interceptor
+
+# 2. Go 의존성 해석 및 에이전트 빌드
+go mod tidy
+go build ./...
+
+# 3. Buildah로 에이전트 이미지 빌드 & 푸시
+#    (필요 시 먼저 로그인: buildah login ghcr.io)
+buildah bud -f Dockerfile -t ghcr.io/gprojectdev/gpu-cr-node-agent:latest .
+buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
+  docker://ghcr.io/gprojectdev/gpu-cr-node-agent:latest
+
+# 4. 클러스터에 설치
+kubectl apply -f config/crd/gpu-cr.io_gpucheckpoints.yaml
+kubectl apply -f deploy/rbac.yaml
+kubectl apply -f deploy/daemonset.yaml
+
+# 5. GPU Pod 실행 및 체크포인트 요청
+kubectl apply -f deploy/sample-pod.yaml
+kubectl apply -f deploy/sample-gpucheckpoint.yaml
+
+# 6. 확인
+kubectl get gpucheckpoints
+# NAME            POD            NODE        PERIOD   PHASE       COUNT   LAST
+# ckpt-vllm-001   vllm-gcr-pod   gpu-node-1  000500   Completed   3       30s
+```
+
+### Buildah 참고
+
+- `buildah bud`는 `buildah build`의 별칭으로, `Dockerfile`/`Containerfile`을 그대로
+  읽습니다. (`-f Dockerfile` 생략 시 현재 디렉토리의 `Containerfile` →
+  `Dockerfile` 순으로 탐색)
+- 루트리스로 빌드하려면 `buildah unshare` 컨텍스트나 적절한 subuid/subgid 설정이
+  필요할 수 있습니다.
+- 레지스트리 인증: `buildah login ghcr.io` 실행 후 사용자명/토큰 입력.
+- 멀티 아키텍처가 필요하면 `buildah bud --platform=linux/amd64` 등으로 지정합니다.
+- 빌드 결과를 로컬 컨테이너 스토리지에서 확인: `buildah images`.
+
+---
+
+## 개발
+
+```bash
+go test ./...            # 단위 테스트 (period 파싱 등)
+go vet ./...
+make -C interceptor      # libgcr-interceptor.so 빌드
+```
+
+에이전트의 `--dry-run=true` 모드는 권한이 필요한 호스트 작업
+(`cuda-checkpoint`, kubelet API, crictl)을 건너뛰면서도 reconcile, 상태 갱신,
+스토리지 레이아웃은 그대로 실행합니다. 로컬/kind 클러스터에 유용합니다.
+
+---
+
+## 로드맵
+
+DCN Progress Report의 세 가지 질문을 따릅니다.
+
+1. **GCR의 K8s 통합** — `GPUCheckpoint` CR + CR을 직접 watch하는 Node Agent(별도
+   컨트롤러 없음) *(현재 단계)*; custom container runtime 기반 복원 경로 *(다음)*.
+2. **PhOS 동시 체크포인팅** — Copy-on-Write 데이터버퍼 체크포인트 후 제어 상태
+   체크포인트.
+3. **CRIUgpu 통합** — 대체 제어 상태 체크포인트 백엔드.
+
+복원 순서(예정): **Control State → GPU Data Buffer**, Restore Pod 어노테이션을
+custom CRI-O/runtime이 처리하는 방식으로 트리거.
+
+---
+
+## 감사의 글
+
+GCR 설계 및 업스트림 코드는 Shaoxun Zeng, Tingxu Ren, Jiwu Shu, Youyou Lu
+(칭화대학교), FAST '26의 결과물입니다. 본 저장소는 분산 클라우드·네트워크 연구실
+(DCN Lab)에서 개발한 독립적인 쿠버네티스 통합 구현입니다.

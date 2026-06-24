@@ -235,4 +235,151 @@ nvidia-ctk --version
 
 > The **GCR hook driver** (`libcuda.so`) that performs the actual selective
 > `cuMem*` interception is **not** part of this repo. Build it from upstream
-> [`thustorage/GCR
+> [`thustorage/GCR`](https://github.com/thustorage/GCR) (`GCR/build.sh`) and place
+> the resulting `libcuda.so` into `/var/lib/gpu-cr/lib/` on each GPU node, next to
+> the `libgcr-interceptor.so` the agent installs. Without it, the shim falls back
+> to the real driver (no GPU-side C/R).
+
+### 3. Container runtime with checkpoint support
+
+Use **containerd ≥ 1.7** or **CRI-O ≥ 1.25** built with CRIU support.
+
+```bash
+# containerd: confirm the CRI socket the agent will use
+ls -l /run/containerd/containerd.sock
+# CRI-O alternative: /run/crio/crio.sock  (update the DaemonSet hostPath accordingly)
+```
+
+### 4. Kubernetes cluster configuration
+
+```text
+# Kubernetes v1.30+ recommended.
+# Enable the ContainerCheckpoint feature gate on BOTH the kubelet and the
+# kube-apiserver (beta in 1.30; enable explicitly on older versions):
+#   --feature-gates=ContainerCheckpoint=true
+```
+
+- **NVIDIA device plugin** (and ideally GPU Feature Discovery) so Pods can request
+  `nvidia.com/gpu` and nodes carry the `nvidia.com/gpu.present=true` label the
+  DaemonSet selects on:
+  ```bash
+  kubectl get nodes -L nvidia.com/gpu.present
+  kubectl describe node <gpu-node> | grep nvidia.com/gpu
+  ```
+- **PodSecurity**: the agent runs `privileged`, `hostPID`, `hostNetwork`. Label
+  the namespace to allow it:
+  ```bash
+  kubectl label ns gpu-cr-system pod-security.kubernetes.io/enforce=privileged
+  ```
+- **kubelet checkpoint API access**: the agent's ServiceAccount is granted
+  `nodes/checkpoint` + `nodes/proxy` via `deploy/rbac.yaml`. Confirm the kubelet
+  serves on `:10250` and that authn/authz (webhook) is enabled (default on
+  kubeadm clusters).
+
+### 5. Build & registry tooling (on your build host)
+
+```bash
+go version          # 1.22+
+gcc --version ; make --version
+buildah --version   # used instead of Docker to build the image
+# A reachable image registry you can push to (e.g. ghcr.io) and pull from on nodes.
+buildah login ghcr.io
+```
+
+### 6. Pre-flight verification (run on a GPU node)
+
+```bash
+nvidia-smi -L                                   # GPU visible
+cuda-checkpoint --help                          # driver C/R available
+sudo criu check                                 # CRIU healthy
+ls /run/containerd/containerd.sock              # CRI socket present
+kubectl version --short                         # server >= v1.30
+kubectl get --raw /api/v1/nodes/$(hostname)/proxy/checkpoint/ 2>&1 | head  # endpoint reachable (403/expects POST = OK)
+ls /var/lib/gpu-cr/lib/libcuda.so               # GCR hook driver staged (after step 2)
+```
+
+If any GPU/CRIU item is missing, you can still validate the orchestration with
+`--dry-run=true` (no privileged host ops are performed).
+
+### Single-node vs multi-node
+
+- **Single-node test**: `storage.type: hostPath` is enough (checkpoint stays on
+  the node).
+- **Multi-node / migration test**: use shared storage (`type: nfs`, mount the
+  same path on every node) so a checkpoint taken on one node is reachable from the
+  restore node.
+
+---
+
+## Quick start
+
+Make sure the [prerequisites](#prerequisites--server-setup) above are met. Use
+`--dry-run=true` to exercise the control flow on a cluster without GPUs.
+
+```bash
+# 1. Build the interceptor shim
+make -C interceptor
+
+# 2. Resolve Go deps and build the agent
+go mod tidy
+go build ./...
+
+# 3. Build & push the agent image with Buildah
+buildah bud -f Dockerfile -t ghcr.io/gprojectdev/gpu-cr-node-agent:latest .
+buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
+  docker://ghcr.io/gprojectdev/gpu-cr-node-agent:latest
+# (login first if needed: buildah login ghcr.io)
+
+# 4. Install into the cluster
+kubectl apply -f config/crd/gpu-cr.io_gpucheckpoints.yaml
+kubectl apply -f deploy/rbac.yaml
+kubectl apply -f deploy/daemonset.yaml
+
+# 5. Run a GPU Pod and request checkpoints
+kubectl apply -f deploy/sample-pod.yaml
+kubectl apply -f deploy/sample-gpucheckpoint.yaml
+
+# 6. Observe
+kubectl get gpucheckpoints
+# NAME            POD            NODE        PERIOD   PHASE       COUNT   LAST
+# ckpt-vllm-001   vllm-gcr-pod   gpu-node-1  000500   Completed   3       30s
+```
+
+---
+
+## Development
+
+```bash
+go test ./...            # unit tests (period parsing, etc.)
+go vet ./...
+make -C interceptor      # build libgcr-interceptor.so
+```
+
+The agent's `--dry-run=true` mode skips privileged host operations
+(`cuda-checkpoint`, kubelet API, crictl) while still exercising reconciliation,
+status updates, and the storage layout — useful for local/kind clusters.
+
+---
+
+## Roadmap
+
+Tracks the three questions in the DCN Progress Report:
+
+1. **Integrate GCR into K8s** — `GPUCheckpoint` CR + Node Agent that watches the
+   CR directly (no separate controller) *(this phase)*; restore path via a custom
+   container runtime *(next)*.
+2. **PhOS concurrent checkpointing** — Copy-on-Write data-buffer checkpoint then
+   control-state checkpoint.
+3. **CRIUgpu integration** — alternative control-state checkpoint backend.
+
+Restore ordering (planned): **Control State → GPU Data Buffer**, triggered by a
+Restore Pod annotation handled by a custom CRI-O/runtime.
+
+---
+
+## Acknowledgements
+
+GCR design and upstream code by Shaoxun Zeng, Tingxu Ren, Jiwu Shu, and Youyou Lu
+(Tsinghua University), FAST '26. This repository is an independent Kubernetes
+integration developed at the Distributed Cloud and Network Research Laboratory
+(DCN Lab).

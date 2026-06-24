@@ -365,4 +365,42 @@ From the master, once everything is up:
 # 1. Run a GPU workload wired for GCR interception
 kubectl apply -f deploy/sample-pod.yaml
 
-# 2. Set podRef.nodeInfo in deploy/sample-gpucheckpoint.yaml to the 
+# 2. Set podRef.nodeInfo in deploy/sample-gpucheckpoint.yaml to the worker name,
+#    then request checkpoints
+kubectl apply -f deploy/sample-gpucheckpoint.yaml
+
+# 3. Watch the CR status update (Phase -> Completed, Count increments per period)
+kubectl get gpucheckpoints -w
+
+# 4. Inspect the produced archive on the worker
+ssh <worker> 'ls -lh /var/lib/gcr-checkpoint/'
+```
+
+### Pre-flight checklist (run on a worker)
+
+```bash
+nvidia-smi -L
+cuda-checkpoint --help
+criu check
+ls /run/containerd/containerd.sock
+ls /var/lib/gpu-cr/lib/libcuda.so
+kubectl version            # (from master) server >= v1.30
+```
+
+### Dry-run (no GPU available)
+
+Set `--dry-run=true` in `deploy/daemonset.yaml` (already an arg) to validate the
+reconcile loop, CR status updates, and storage layout without driver/CRIU.
+
+---
+
+# Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| `kubelet checkpoint returned 404/feature` | `ContainerCheckpoint` gate not enabled on kubelet **and** apiserver. Re-check A-5 / B-1. |
+| `criu check` fails | CRIU too old or missing kernel options; build ≥ 3.17 from source. |
+| Pod can't see GPU | NVIDIA driver/toolkit not installed, or containerd not configured (C-1/C-2). |
+| node-agent not scheduled | Node missing `nvidia.com/gpu.present=true` label (B-5) or PodSecurity blocking privileged (B-6 label). |
+| `cuda-checkpoint: command not found` | Driver < 550; install a 550+ branch (C-1). |
+| No GPU-side checkpoint | GCR hook `libcuda.so` not staged in `/var/lib/gpu-cr/lib/` (C-5). |

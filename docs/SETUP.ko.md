@@ -363,4 +363,42 @@ kubectl describe node <worker> | grep nvidia.com/gpu   # nvidia.com/gpu: 1
 # 1. GCR 인터셉션이 연결된 GPU 워크로드 실행
 kubectl apply -f deploy/sample-pod.yaml
 
-# 2. deploy/sample-gpucheckpoint.yaml의 podRef.
+# 2. deploy/sample-gpucheckpoint.yaml의 podRef.nodeInfo를 worker 이름으로 설정 후
+#    체크포인트 요청
+kubectl apply -f deploy/sample-gpucheckpoint.yaml
+
+# 3. CR 상태 갱신 확인 (Phase -> Completed, period마다 Count 증가)
+kubectl get gpucheckpoints -w
+
+# 4. worker에서 생성된 아카이브 확인
+ssh <worker> 'ls -lh /var/lib/gcr-checkpoint/'
+```
+
+### 사전 점검 체크리스트 (worker에서)
+
+```bash
+nvidia-smi -L
+cuda-checkpoint --help
+criu check
+ls /run/containerd/containerd.sock
+ls /var/lib/gpu-cr/lib/libcuda.so
+kubectl version            # (master에서) 서버 >= v1.30
+```
+
+### Dry-run (GPU 없는 환경)
+
+`deploy/daemonset.yaml`의 `--dry-run=true`(이미 인자로 존재)로 설정하면 드라이버/
+CRIU 없이 reconcile 루프, CR 상태 갱신, 스토리지 레이아웃을 검증할 수 있습니다.
+
+---
+
+# 트러블슈팅
+
+| 증상 | 원인 / 해결 |
+|------|-------------|
+| `kubelet checkpoint returned 404/feature` | kubelet **과** apiserver에 `ContainerCheckpoint` gate 미활성화. A-5 / B-1 재확인. |
+| `criu check` 실패 | CRIU가 너무 오래됐거나 커널 옵션 부족; 소스로 ≥ 3.17 빌드. |
+| Pod가 GPU를 못 봄 | NVIDIA 드라이버/툴킷 미설치 또는 containerd 미구성 (C-1/C-2). |
+| node-agent가 스케줄 안 됨 | 노드에 `nvidia.com/gpu.present=true` 라벨 없음 (B-5) 또는 PodSecurity가 privileged 차단 (B-6 라벨). |
+| `cuda-checkpoint: command not found` | 드라이버 < 550; 550+ 브랜치 설치 (C-1). |
+| GPU 측 체크포인트 안 됨 | GCR hook `libcuda.so`가 `/var/lib/gpu-cr/lib/`에 없음 (C-5). |
