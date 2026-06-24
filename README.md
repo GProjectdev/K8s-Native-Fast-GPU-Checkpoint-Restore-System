@@ -7,8 +7,11 @@ C/R** into a Kubernetes cluster so that GPU Pods can be checkpointed
 transparently, on a schedule, without modifying the workload.
 
 > Status: **Phase 1** — `GPUCheckpoint` CR + `GPU C/R Node Agent` (checkpoint
-> path). The GPU C/R Controller and the restore path (custom container runtime)
-> are planned in later phases (see [Roadmap](#roadmap)).
+> path). There is **no separate GPU C/R Controller**: the `GPUCheckpoint` CR
+> carries everything required (`podRef.nodeInfo`, `storage`, `period`), and each
+> Node Agent **watches the CR directly** and acts on the ones targeting its own
+> node. The restore path (custom container runtime) is planned next
+> (see [Roadmap](#roadmap)).
 
 > 🇰🇷 한국어 문서: [`README.ko.md`](README.ko.md)
 
@@ -46,24 +49,26 @@ This project wires those mechanisms into Kubernetes primitives.
                        Kubernetes Cluster
   Control Plane
   ┌───────────────────────────────────────────────────────────┐
-  │   GPUCheckpoint CR  ──(1) get CR info──►  GPU C/R Controller │  (Phase 2)
+  │   GPUCheckpoint CR  (podRef.nodeInfo, storage, period)        │
   └───────────────────────────────────────────────────────────┘
-                                   │ (2) trigger
-  Worker Node                      ▼
+                          ▲
+                          │ (1) Watch  — no separate controller
+  Worker Node             │
   ┌───────────────────────────────────────────────────────────┐
   │  GPU Pod                              GPU C/R Node Agent      │
   │   ├─ GPU APP                          (DaemonSet, this repo)  │
-  │   └─ GPU Selective Interceptor  ◄──(3) signal / checkpoint    │
+  │   └─ GPU Selective Interceptor  ◄──(2) signal / checkpoint    │
   │        (libgcr-interceptor.so)                                │
   └───────────────────────────────────────────────────────────┘
-                                   │ (4) push Checkpoint.tar
+                                   │ (3) push Checkpoint.tar
                                    ▼
                           Shared Storage (hostPath / NFS / S3)
 ```
 
-The Node Agent runs **one replica per node** (DaemonSet) and only acts on a
-`GPUCheckpoint` whose target Pod lives on its own node, so all heavy operations
-are local.
+There is **no GPU C/R Controller**. The Node Agent runs **one replica per node**
+(DaemonSet), watches `GPUCheckpoint` CRs directly, and acts only on the ones
+whose `podRef.nodeInfo` matches its own node — so all heavy operations are local
+and the control plane stays a single declarative CR.
 
 ### Checkpoint pipeline (per `GPUCheckpoint`)
 
@@ -93,10 +98,10 @@ metadata:
   namespace: default
 spec:
   podRef:                       # which Pod (and where) to checkpoint
+    nodeInfo: gpu-node-1        # node the Pod runs on; the agent on this node acts on the CR
     namespace: default
     name: vllm-gcr-pod
     container: vllm             # optional; defaults to the first container
-    # nodeName: gpu-node-1      # optional; resolved from the Pod when omitted
   storage:                      # which filesystem / path to store the artifact
     type: hostPath              # hostPath | nfs | s3
     path: /var/lib/gcr-checkpoint
@@ -106,7 +111,7 @@ spec:
 
 | Field | Meaning |
 |-------|---------|
-| `podRef` | Target Pod: name, namespace, container, optional node. The agent only acts when the resolved node matches itself. |
+| `podRef` | Target Pod: `nodeInfo` (node the Pod runs on), `namespace`, `name`, `container`. The agent only acts when `nodeInfo` matches the node it runs on; if `nodeInfo` is empty it falls back to resolving the node from the Pod. |
 | `storage` | Backend type and path where `Checkpoint.tar` is written. |
 | `period` | Fixed-width `HHMMSS` checkpoint interval. `"000030"`=30 s, `"000500"`=5 min, `"010000"`=hourly. `"000000"` or empty = one-shot. |
 | `incremental` | Enable GCR shadow-execution incremental checkpointing after the first checkpoint. |
@@ -248,17 +253,4 @@ status updates, and the storage layout — useful for local/kind clusters.
 
 Tracks the three questions in the DCN Progress Report:
 
-1. **Integrate GCR into K8s** — `GPUCheckpoint` CR + Node Agent *(this phase)*;
-   GPU C/R Controller + restore path via a custom container runtime *(next)*.
-2. **PhOS concurrent checkpointing** — Copy-on-Write data-buffer checkpoint then
-   control-state checkpoint.
-3. **CRIUgpu integration** — alternative control-state checkpoint backend.
-
-Restore ordering (planned): **Control State → GPU Data Buffer**, triggered by a
-Restore Pod annotation handled by a custom CRI-O/runtime.
-
----
-
-## Acknowledgements
-
-GCR d
+1. **Integrate GCR into K8s** — `GPUCheckpoint` CR + Node

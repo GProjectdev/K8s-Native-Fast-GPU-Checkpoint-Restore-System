@@ -19,11 +19,13 @@ type PodRef struct {
 	// +optional
 	Container string `json:"container,omitempty"`
 
-	// NodeName optionally pins the target node. When empty the agent resolves
-	// the node from the Pod's spec.nodeName at reconcile time. A Node Agent only
-	// acts on a CR whose resolved node matches the node the agent runs on.
+	// NodeInfo names the node the target Pod runs on. Per the DCN design, the
+	// GPUCheckpoint CR carries everything the Node Agent needs, so the agent can
+	// act directly on the CR (it watches CRs and only handles those whose
+	// NodeInfo matches the node it runs on). When empty, the agent falls back to
+	// resolving the node from the Pod's spec.nodeName at reconcile time.
 	// +optional
-	NodeName string `json:"nodeName,omitempty"`
+	NodeInfo string `json:"nodeInfo,omitempty"`
 }
 
 // StorageType enumerates the supported checkpoint backends.
@@ -141,8 +143,4 @@ type GPUCheckpoint struct {
 // +kubebuilder:object:root=true
 
 // GPUCheckpointList contains a list of GPUCheckpoint.
-type GPUCheckpointList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []GPUCheckpoint `json:"items"`
-}
+type GPUChec

@@ -35,8 +35,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Resolve the target node.
-	targetNode := cr.Spec.PodRef.NodeName
+	// Resolve the target node. The CR carries nodeInfo per the DCN design, so the
+	// Node Agent can act directly on the CR without any separate controller.
+	targetNode := cr.Spec.PodRef.NodeInfo
 	container := cr.Spec.PodRef.Container
 	var podUID string
 	if targetNode == "" || container == "" {
@@ -161,8 +162,4 @@ func setCondition(status *gpucrv1alpha1.GPUCheckpointStatus, condType string, s 
 }
 
 // SetupWithManager registers the reconciler with the controller manager.
-func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&gpucrv1alpha1.GPUCheckpoint{}).
-		Complete(r)
-}
+func (r *Reconciler) SetupWithManag

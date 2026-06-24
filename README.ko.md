@@ -7,8 +7,10 @@
 쿠버네티스 환경으로 가져온 것이 핵심입니다.
 
 > 상태: **Phase 1** — `GPUCheckpoint` CR + `GPU C/R Node Agent` (체크포인트 경로).
-> GPU C/R Controller와 복원 경로(custom container runtime)는 이후 단계에서
-> 구현 예정입니다. ([로드맵](#로드맵) 참고)
+> **별도의 GPU C/R Controller는 없습니다.** `GPUCheckpoint` CR에 필요한 정보
+> (`podRef.nodeInfo`, `storage`, `period`)를 모두 담아두면, 각 Node Agent가 CR을
+> **직접 watch**하여 자신의 노드를 대상으로 하는 CR을 수행합니다. 복원 경로(custom
+> container runtime)는 다음 단계입니다. ([로드맵](#로드맵) 참고)
 
 본 작업의 기반:
 
@@ -43,24 +45,26 @@
                        Kubernetes Cluster
   Control Plane
   ┌───────────────────────────────────────────────────────────┐
-  │   GPUCheckpoint CR  ──(1) CR 정보 조회──►  GPU C/R Controller │  (Phase 2)
+  │   GPUCheckpoint CR  (podRef.nodeInfo, storage, period)        │
   └───────────────────────────────────────────────────────────┘
-                                   │ (2) 트리거
-  Worker Node                      ▼
+                          ▲
+                          │ (1) Watch  — 별도 컨트롤러 없음
+  Worker Node             │
   ┌───────────────────────────────────────────────────────────┐
   │  GPU Pod                              GPU C/R Node Agent      │
   │   ├─ GPU APP                          (DaemonSet, 본 저장소)  │
-  │   └─ GPU Selective Interceptor  ◄──(3) 시그널 / 체크포인트     │
+  │   └─ GPU Selective Interceptor  ◄──(2) 시그널 / 체크포인트     │
   │        (libgcr-interceptor.so)                                │
   └───────────────────────────────────────────────────────────┘
-                                   │ (4) Checkpoint.tar 푸시
+                                   │ (3) Checkpoint.tar 푸시
                                    ▼
                           Shared Storage (hostPath / NFS / S3)
 ```
 
-Node Agent는 **노드당 1개**(DaemonSet)로 동작하며, 대상 Pod가 자신의 노드에 있는
-`GPUCheckpoint`에만 반응합니다. 따라서 모든 무거운 작업은 항상 로컬에서
-수행됩니다.
+**GPU C/R Controller는 없습니다.** Node Agent가 **노드당 1개**(DaemonSet)로
+동작하며 `GPUCheckpoint` CR을 직접 watch하고, `podRef.nodeInfo`가 자신의 노드와
+일치하는 CR만 수행합니다. 따라서 모든 무거운 작업은 로컬에서 이뤄지고, 컨트롤
+플레인은 선언적 CR 하나로 유지됩니다.
 
 ### 체크포인트 파이프라인 (`GPUCheckpoint` 단위)
 
@@ -89,10 +93,10 @@ metadata:
   namespace: default
 spec:
   podRef:                       # 어떤 Pod(어느 노드)를 체크포인트할지
+    nodeInfo: gpu-node-1        # Pod가 있는 노드; 이 노드의 에이전트가 CR을 수행
     namespace: default
     name: vllm-gcr-pod
     container: vllm             # 선택값; 생략 시 첫 번째 컨테이너 사용
-    # nodeName: gpu-node-1      # 선택값; 생략 시 Pod에서 노드 해석
   storage:                      # 아카이브를 저장할 파일시스템 / 경로
     type: hostPath              # hostPath | nfs | s3
     path: /var/lib/gcr-checkpoint
@@ -102,7 +106,7 @@ spec:
 
 | 필드 | 의미 |
 |------|------|
-| `podRef` | 대상 Pod: name, namespace, container, 선택적 node. 해석된 노드가 자신과 같을 때만 에이전트가 동작. |
+| `podRef` | 대상 Pod: `nodeInfo`(Pod가 있는 노드), `namespace`, `name`, `container`. `nodeInfo`가 자신의 노드와 같을 때만 에이전트가 동작하며, 비어 있으면 Pod에서 노드를 해석. |
 | `storage` | `Checkpoint.tar`를 기록할 백엔드 타입과 경로. |
 | `period` | 고정폭 `HHMMSS` 체크포인트 주기. `"000030"`=30초, `"000500"`=5분, `"010000"`=1시간. `"000000"` 또는 빈 값 = 1회. |
 | `incremental` | 첫 체크포인트 이후 GCR 섀도우 실행 기반 증분 체크포인팅 활성화. |
@@ -255,19 +259,8 @@ make -C interceptor      # libgcr-interceptor.so 빌드
 
 DCN Progress Report의 세 가지 질문을 따릅니다.
 
-1. **GCR의 K8s 통합** — `GPUCheckpoint` CR + Node Agent *(현재 단계)*; GPU C/R
-   Controller + custom container runtime 기반 복원 경로 *(다음)*.
+1. **GCR의 K8s 통합** — `GPUCheckpoint` CR + CR을 직접 watch하는 Node Agent(별도
+   컨트롤러 없음) *(현재 단계)*; custom container runtime 기반 복원 경로 *(다음)*.
 2. **PhOS 동시 체크포인팅** — Copy-on-Write 데이터버퍼 체크포인트 후 제어 상태
    체크포인트.
-3. **CRIUgpu 통합** — 대체 제어 상태 체크포인트 백엔드.
-
-복원 순서(예정): **Control State → GPU Data Buffer**, Restore Pod 어노테이션을
-custom CRI-O/runtime이 처리하는 방식으로 트리거.
-
----
-
-## 감사의 글
-
-GCR 설계 및 업스트림 코드는 Shaoxun Zeng, Tingxu Ren, Jiwu Shu, Youyou Lu
-(칭화대학교), FAST '26의 결과물입니다. 본 저장소는 분산 클라우드·네트워크 연구실
-(DCN Lab)에서 개발한 독립적인 쿠버네티스 통합 구현입니다.
+3. **CRIUgpu 통합** — 

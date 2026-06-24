@@ -7,14 +7,13 @@ metadata:
   namespace: default
 spec:
   podRef:
+    nodeInfo: gpu-node-1     # node the Pod runs on; the Node Agent on this node acts on the CR
     namespace: default
     name: vllm-gcr-pod
     container: vllm
-    # nodeName: gpu-node-1   # optional; resolved from the Pod when omitted
   storage:
     type: hostPath           # hostPath | nfs | s3
     path: /var/lib/gcr-checkpoint
   # Checkpoint every 5 minutes (HHMMSS). Use "000000" (or omit) for one-shot.
   period: "000500"
   # Take only dirty buffers after the first checkpoint (GCR shadow execution).
-  incremental: true
