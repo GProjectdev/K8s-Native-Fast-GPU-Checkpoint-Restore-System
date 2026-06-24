@@ -183,7 +183,43 @@ GPU 노드에 `nvidia.com/gpu.present=true` 라벨이 자동으로 안 붙으면
 kubectl label node <worker-name> nvidia.com/gpu.present=true
 ```
 
-### B-6. 본 시스템 배포 (worker 조인 후)
+### B-6. GPU C/R Node Agent 이미지 빌드 & 푸시 (Buildah)
+
+DaemonSet은 컨테이너 이미지를 실행하므로, 배포 전에 이미지를 빌드·게시해야
+합니다. Go 1.22+, gcc/make, Buildah가 있는 **빌드 호스트**(master 또는 저장소에
+접근 가능한 워크스테이션)에서 실행하세요.
+
+```bash
+# 빌드 도구 설치 (Ubuntu)
+apt-get install -y golang-go gcc make buildah
+
+# 저장소 루트에서: 에이전트 + 인터셉터 shim을 한 이미지로 빌드
+buildah bud -f Dockerfile -t ghcr.io/gprojectdev/gpu-cr-node-agent:latest .
+
+# 노드가 pull 가능한 레지스트리로 푸시
+buildah login ghcr.io                         # 사용자명 + PAT/토큰
+buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
+  docker://ghcr.io/gprojectdev/gpu-cr-node-agent:latest
+```
+
+> 이미지 이름은 `deploy/daemonset.yaml`의 `image:`와 일치해야 합니다. 다른
+> 레지스트리/이름을 쓰면 해당 필드를 수정하세요.
+
+**에어갭 / 레지스트리 없음?** 푸시 대신 OCI 아카이브로 내보내 각 GPU worker의
+containerd에 import 하세요:
+
+```bash
+# 빌드 호스트에서
+buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
+  oci-archive:/tmp/gpu-cr-node-agent.tar:ghcr.io/gprojectdev/gpu-cr-node-agent:latest
+scp /tmp/gpu-cr-node-agent.tar <worker>:/tmp/
+
+# 각 GPU worker에서 — containerd가 쓰는 k8s.io 네임스페이스로 import
+ctr -n k8s.io images import /tmp/gpu-cr-node-agent.tar
+# 이후 imagePullPolicy: IfNotPresent (DaemonSet 기본값) 사용.
+```
+
+### B-7. 본 시스템 배포 (worker 조인 + 이미지 게시 후)
 
 ```bash
 # 저장소 루트에서, master에서:
@@ -327,42 +363,4 @@ kubectl describe node <worker> | grep nvidia.com/gpu   # nvidia.com/gpu: 1
 # 1. GCR 인터셉션이 연결된 GPU 워크로드 실행
 kubectl apply -f deploy/sample-pod.yaml
 
-# 2. deploy/sample-gpucheckpoint.yaml의 podRef.nodeInfo를 worker 이름으로 설정 후
-#    체크포인트 요청
-kubectl apply -f deploy/sample-gpucheckpoint.yaml
-
-# 3. CR 상태 갱신 확인 (Phase -> Completed, period마다 Count 증가)
-kubectl get gpucheckpoints -w
-
-# 4. worker에서 생성된 아카이브 확인
-ssh <worker> 'ls -lh /var/lib/gcr-checkpoint/'
-```
-
-### 사전 점검 체크리스트 (worker에서)
-
-```bash
-nvidia-smi -L
-cuda-checkpoint --help
-criu check
-ls /run/containerd/containerd.sock
-ls /var/lib/gpu-cr/lib/libcuda.so
-kubectl version            # (master에서) 서버 >= v1.30
-```
-
-### Dry-run (GPU 없는 환경)
-
-`deploy/daemonset.yaml`의 `--dry-run=true`(이미 인자로 존재)로 설정하면 드라이버/
-CRIU 없이 reconcile 루프, CR 상태 갱신, 스토리지 레이아웃을 검증할 수 있습니다.
-
----
-
-# 트러블슈팅
-
-| 증상 | 원인 / 해결 |
-|------|-------------|
-| `kubelet checkpoint returned 404/feature` | kubelet **과** apiserver에 `ContainerCheckpoint` gate 미활성화. A-5 / B-1 재확인. |
-| `criu check` 실패 | CRIU가 너무 오래됐거나 커널 옵션 부족; 소스로 ≥ 3.17 빌드. |
-| Pod가 GPU를 못 봄 | NVIDIA 드라이버/툴킷 미설치 또는 containerd 미구성 (C-1/C-2). |
-| node-agent가 스케줄 안 됨 | 노드에 `nvidia.com/gpu.present=true` 라벨 없음 (B-5) 또는 PodSecurity가 privileged 차단 (B-6 라벨). |
-| `cuda-checkpoint: command not found` | 드라이버 < 550; 550+ 브랜치 설치 (C-1). |
-| GPU 측 체크포인트 안 됨 | GCR hook `libcuda.so`가 `/var/lib/gpu-cr/lib/`에 없음 (C-5). |
+# 2. deploy/sample-gpucheckpoint.yaml의 podRef.
