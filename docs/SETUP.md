@@ -264,22 +264,56 @@ Run Part C on **each GPU worker**. (Part A must already be done on this node.)
 
 ### C-1. Install the NVIDIA driver (≥ 550)
 
-```bash
-# Add the CUDA/NVIDIA repo for Ubuntu 22.04
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-dpkg -i cuda-keyring_1.1-1_all.deb
-apt-get update
+> **Critical — DKMS / GCC match.** The driver's kernel module is compiled with
+> the system's default `gcc`, which **must match the GCC the running kernel was
+> built with**. On Ubuntu 22.04 with a 6.8 HWE/cloud kernel (e.g. GCP), the kernel
+> is built with **GCC 12** while the default `gcc` is 11, so the DKMS build fails
+> with `unrecognized command-line option '-ftrivial-auto-var-init=zero'`. Install
+> and select GCC 12 **before** installing the driver.
 
-# Install a driver branch >= 550 (e.g. 550 or 560)
-apt-get install -y nvidia-driver-550
-reboot
+```bash
+# 0) Make the build toolchain match the kernel's compiler
+sudo apt-get update
+sudo apt-get install -y build-essential dkms gcc-12 linux-headers-$(uname -r)
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 60
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 50
+sudo update-alternatives --set gcc /usr/bin/gcc-12
+cat /proc/version          # note the GCC version the kernel was built with
+gcc --version              # must match (e.g. 12.x)
+
+# 1) Add the CUDA/NVIDIA repo for Ubuntu 22.04
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+
+# 2) Install a driver branch >= 550. For A100 / datacenter GPUs on recent
+#    kernels, the open-module flavor (nvidia-driver-550-open) is recommended.
+sudo apt-get install -y nvidia-driver-550
+sudo reboot
 ```
 
-After reboot, verify the driver **and** the `cuda-checkpoint` binary:
+After reboot, verify the module built, loaded, and the GPU is visible:
 
 ```bash
-nvidia-smi                       # driver 550.x+
-which cuda-checkpoint            # /usr/bin/cuda-checkpoint
+sudo dkms status           # nvidia/550.x, <kernel>: installed   (NOT just "added")
+sudo modprobe nvidia
+nvidia-smi                 # shows the GPU + driver 550.x
+```
+
+> If `dkms status` shows `added` (not `installed`), or `nvidia-smi` reports
+> "couldn't communicate with the NVIDIA driver", the kernel module did not build.
+> This is almost always the GCC mismatch above — see Troubleshooting. After
+> fixing gcc: `sudo dkms install nvidia/<ver> -k $(uname -r) --force`.
+
+### C-1b. Install the `cuda-checkpoint` binary
+
+`cuda-checkpoint` is **not** placed on `PATH` by the apt driver packages. Install
+the prebuilt binary from NVIDIA (requires a working driver):
+
+```bash
+git clone https://github.com/NVIDIA/cuda-checkpoint.git
+ls cuda-checkpoint/bin/                                    # find the x86_64 build dir
+sudo install -m 0755 cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/bin/cuda-checkpoint
 cuda-checkpoint --help
 ```
 
@@ -400,7 +434,9 @@ reconcile loop, CR status updates, and storage layout without driver/CRIU.
 |---------|--------------------|
 | `kubelet checkpoint returned 404/feature` | `ContainerCheckpoint` gate not enabled on kubelet **and** apiserver. Re-check A-5 / B-1. |
 | `criu check` fails | CRIU too old or missing kernel options; build ≥ 3.17 from source. |
-| Pod can't see GPU | NVIDIA driver/toolkit not installed, or containerd not configured (C-1/C-2). |
+| Pod can't see GPU | NVIDIA driver/toolkit not installed, or the container runtime (containerd/CRI-O) not configured (C-1/C-2). |
 | node-agent not scheduled | Node missing `nvidia.com/gpu.present=true` label (B-5) or PodSecurity blocking privileged (B-6 label). |
-| `cuda-checkpoint: command not found` | Driver < 550; install a 550+ branch (C-1). |
+| `nvidia-smi` "couldn't communicate" / `dkms status` = `added` | DKMS module did not build — usually a GCC mismatch. Install `gcc-12`, `update-alternatives --set gcc /usr/bin/gcc-12`, then `dkms install nvidia/<ver> -k $(uname -r) --force` (C-1). |
+| `unrecognized command-line option '-ftrivial-auto-var-init=zero'` | Default `gcc` older than the kernel's build GCC. Install & select `gcc-12` before building the driver (C-1). |
+| `cuda-checkpoint: command not found` | Binary not on PATH; install the prebuilt binary from github.com/NVIDIA/cuda-checkpoint (C-1b). Requires a working driver. |
 | No GPU-side checkpoint | GCR hook `libcuda.so` not staged in `/var/lib/gpu-cr/lib/` (C-5). |

@@ -263,22 +263,55 @@ Part C는 **각 GPU worker**에서 실행합니다. (이 노드에 Part A가 이
 
 ### C-1. NVIDIA 드라이버 설치 (≥ 550)
 
-```bash
-# Ubuntu 22.04용 CUDA/NVIDIA 저장소 추가
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-dpkg -i cuda-keyring_1.1-1_all.deb
-apt-get update
+> **중요 — DKMS / GCC 일치.** 드라이버 커널 모듈은 시스템 기본 `gcc`로 컴파일되며,
+> 이 `gcc`는 **현재 커널을 빌드한 GCC와 일치해야** 합니다. Ubuntu 22.04 + 6.8
+> HWE/클라우드 커널(예: GCP)은 커널이 **GCC 12**로 빌드됐는데 기본 `gcc`가 11이라,
+> DKMS 빌드가 `unrecognized command-line option '-ftrivial-auto-var-init=zero'`로
+> 실패합니다. 드라이버 설치 **전에** GCC 12를 깔고 기본으로 지정하세요.
 
-# 550 이상 드라이버 브랜치 설치 (예: 550 또는 560)
-apt-get install -y nvidia-driver-550
-reboot
+```bash
+# 0) 빌드 툴체인을 커널 컴파일러에 맞춤
+sudo apt-get update
+sudo apt-get install -y build-essential dkms gcc-12 linux-headers-$(uname -r)
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 60
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 50
+sudo update-alternatives --set gcc /usr/bin/gcc-12
+cat /proc/version          # 커널이 빌드된 GCC 버전 확인
+gcc --version              # 일치해야 함 (예: 12.x)
+
+# 1) Ubuntu 22.04용 CUDA/NVIDIA 저장소 추가
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+
+# 2) 550 이상 드라이버 설치. A100/데이터센터 GPU는 최신 커널에서
+#    open 모듈 플레이버(nvidia-driver-550-open)를 권장합니다.
+sudo apt-get install -y nvidia-driver-550
+sudo reboot
 ```
 
-재부팅 후 드라이버 **와** `cuda-checkpoint` 바이너리 확인:
+재부팅 후 모듈 빌드/로드와 GPU 인식 확인:
 
 ```bash
-nvidia-smi                       # 드라이버 550.x+
-which cuda-checkpoint            # /usr/bin/cuda-checkpoint
+sudo dkms status           # nvidia/550.x, <kernel>: installed   ("added"가 아니라)
+sudo modprobe nvidia
+nvidia-smi                 # GPU + 드라이버 550.x 표시
+```
+
+> `dkms status`가 `installed`가 아니라 `added`이거나, `nvidia-smi`가 "couldn't
+> communicate with the NVIDIA driver"라면 커널 모듈이 빌드되지 않은 것입니다.
+> 대부분 위 GCC 불일치가 원인이며(트러블슈팅 참고), gcc를 고친 뒤
+> `sudo dkms install nvidia/<ver> -k $(uname -r) --force`로 재빌드하면 됩니다.
+
+### C-1b. `cuda-checkpoint` 바이너리 설치
+
+apt 드라이버 패키지는 `cuda-checkpoint`를 `PATH`에 넣어주지 않습니다. NVIDIA의
+prebuilt 바이너리를 설치하세요(드라이버가 정상이어야 함):
+
+```bash
+git clone https://github.com/NVIDIA/cuda-checkpoint.git
+ls cuda-checkpoint/bin/                                    # x86_64 빌드 디렉토리 확인
+sudo install -m 0755 cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/bin/cuda-checkpoint
 cuda-checkpoint --help
 ```
 
@@ -398,7 +431,9 @@ CRIU 없이 reconcile 루프, CR 상태 갱신, 스토리지 레이아웃을 검
 |------|-------------|
 | `kubelet checkpoint returned 404/feature` | kubelet **과** apiserver에 `ContainerCheckpoint` gate 미활성화. A-5 / B-1 재확인. |
 | `criu check` 실패 | CRIU가 너무 오래됐거나 커널 옵션 부족; 소스로 ≥ 3.17 빌드. |
-| Pod가 GPU를 못 봄 | NVIDIA 드라이버/툴킷 미설치 또는 containerd 미구성 (C-1/C-2). |
+| Pod가 GPU를 못 봄 | NVIDIA 드라이버/툴킷 미설치 또는 컨테이너 런타임(containerd/CRI-O) 미구성 (C-1/C-2). |
 | node-agent가 스케줄 안 됨 | 노드에 `nvidia.com/gpu.present=true` 라벨 없음 (B-5) 또는 PodSecurity가 privileged 차단 (B-6 라벨). |
-| `cuda-checkpoint: command not found` | 드라이버 < 550; 550+ 브랜치 설치 (C-1). |
+| `nvidia-smi` "couldn't communicate" / `dkms status` = `added` | DKMS 모듈 빌드 실패 — 보통 GCC 불일치. `gcc-12` 설치 후 `update-alternatives --set gcc /usr/bin/gcc-12`, 이어서 `dkms install nvidia/<ver> -k $(uname -r) --force` (C-1). |
+| `unrecognized command-line option '-ftrivial-auto-var-init=zero'` | 기본 `gcc`가 커널 빌드 GCC보다 낮음. 드라이버 빌드 전에 `gcc-12` 설치/선택 (C-1). |
+| `cuda-checkpoint: command not found` | 바이너리가 PATH에 없음; github.com/NVIDIA/cuda-checkpoint의 prebuilt 바이너리 설치 (C-1b). 드라이버 정상 필요. |
 | GPU 측 체크포인트 안 됨 | GCR hook `libcuda.so`가 `/var/lib/gpu-cr/lib/`에 없음 (C-5). |

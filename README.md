@@ -218,9 +218,11 @@ run the agent with `--dry-run=true`.
 ### 2. GPU node OS packages
 
 ```bash
-# NVIDIA driver >= 550 — ships the cuda-checkpoint binary used for control-state C/R
-nvidia-smi                       # driver >= 550.x
-which cuda-checkpoint            # must exist (usually /usr/bin/cuda-checkpoint)
+# NVIDIA driver >= 550 (provides control-state C/R). On Ubuntu 22.04 + a 6.8
+# kernel, install gcc-12 FIRST so the DKMS kernel module builds (see docs/SETUP.md C-1).
+nvidia-smi                       # driver >= 550.x ; GPU visible
+# cuda-checkpoint is NOT on PATH from apt — install the prebuilt binary:
+#   github.com/NVIDIA/cuda-checkpoint  (see docs/SETUP.md C-1b)
 cuda-checkpoint --help
 
 # CRIU >= 3.17 — kubelet/CRI container checkpoint uses it for CPU-side state

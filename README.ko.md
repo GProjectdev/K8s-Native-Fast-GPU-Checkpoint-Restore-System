@@ -210,9 +210,11 @@ volumes:
 ### 2. GPU 노드 OS 패키지
 
 ```bash
-# NVIDIA 드라이버 >= 550 — 제어 상태 C/R에 쓰는 cuda-checkpoint 바이너리 포함
-nvidia-smi                       # 드라이버 >= 550.x
-which cuda-checkpoint            # 존재해야 함 (보통 /usr/bin/cuda-checkpoint)
+# NVIDIA 드라이버 >= 550 (제어 상태 C/R). Ubuntu 22.04 + 6.8 커널에서는
+# DKMS 모듈 빌드를 위해 gcc-12를 먼저 설치하세요 (docs/SETUP.ko.md C-1 참고).
+nvidia-smi                       # 드라이버 >= 550.x ; GPU 인식
+# cuda-checkpoint는 apt로는 PATH에 없음 — prebuilt 바이너리 설치:
+#   github.com/NVIDIA/cuda-checkpoint  (docs/SETUP.ko.md C-1b 참고)
 cuda-checkpoint --help
 
 # CRIU >= 3.17 — kubelet/CRI 컨테이너 체크포인트가 CPU 측 상태 저장에 사용
