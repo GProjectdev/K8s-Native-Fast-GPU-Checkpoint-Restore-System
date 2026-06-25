@@ -1,0 +1,103 @@
+# GPU C/R Node Agent — CRI-O variant (verified on K8s v1.33 + CRI-O v1.33).
+# Differences from deploy/daemonset.yaml (containerd):
+#   - CRI socket DIRECTORY /run/crio mounted (not the .sock file) so crio restarts
+#     don't stale the mount; CONTAINER_RUNTIME_ENDPOINT points at it.
+#   - metrics/health on :9290/:9291 (8080/8081 collide under hostNetwork).
+#   - checkpoint output dir + cuda-checkpoint host binary wired.
+# Set `image:` to your registry tag before applying.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-cr-node-agent
+  namespace: gpu-cr-system
+  labels:
+    app.kubernetes.io/name: gpu-cr-node-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gpu-cr-node-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gpu-cr-node-agent
+    spec:
+      serviceAccountName: gpu-cr-node-agent
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: node-agent
+          image: docker.io/<your-dockerhub-user>/gpu-cr-node-agent:v1.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - --kubelet-url=https://127.0.0.1:10250
+            - --kubelet-insecure=true
+            - --host-lib-dir=/host/gpu-cr/lib
+            - --host-run-dir=/host/gpu-cr/run
+            - --interceptor-dist-dir=/opt/gpu-cr-dist
+            - --dry-run=false
+            - --metrics-bind-address=:9290
+            - --health-probe-bind-address=:9291
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CONTAINER_RUNTIME_ENDPOINT
+              value: unix:///run/crio/crio.sock
+            - name: CUDA_CHECKPOINT_BIN
+              value: /host/usr/bin/cuda-checkpoint
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: gpu-cr-host
+              mountPath: /host/gpu-cr
+            - name: host-usr-bin
+              mountPath: /host/usr/bin
+              readOnly: true
+            - name: kubelet-checkpoints
+              mountPath: /var/lib/kubelet/checkpoints
+            - name: gcr-checkpoint
+              mountPath: /var/lib/gcr-checkpoint
+            - name: cri-sock
+              mountPath: /run/crio
+          ports:
+            - name: metrics
+              containerPort: 9290
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9291
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9291
+            initialDelaySeconds: 10
+      volumes:
+        - name: gpu-cr-host
+          hostPath:
+            path: /var/lib/gpu-cr
+            type: DirectoryOrCreate
+        - name: host-usr-bin
+          hostPath:
+            path: /usr/bin
+            type: Directory
+        - name: kubelet-checkpoints
+          hostPath:
+            path: /var/lib/kubelet/checkpoints
+            type: DirectoryOrCreate
+        - name: gcr-checkpoint
+          hostPath:
+            path: /var/lib/gcr-checkpoint
+            type: DirectoryOrCreate
+        - name: cri-sock
+          hostPath:
+            path: /run/crio
+            type: Directory

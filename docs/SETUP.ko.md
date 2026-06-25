@@ -1,530 +1,260 @@
-# 설치 가이드 — Master & Worker 노드
+# 설치 & 사용 — 검증된 엔드투엔드 (CRI-O)
 
-**K8s-Native Fast GPU Checkpoint/Restore System**을 실행·테스트하기 위한 단계별
-준비 가이드입니다. 순서대로 따라 하세요. 명령어는 **Ubuntu 22.04 LTS**,
-**Kubernetes v1.30 (kubeadm)**, **containerd** 기준입니다.
-
-> 🇺🇸 English: [`SETUP.md`](SETUP.md)
-
-## 구성도
-
-```
-            ┌──────────────────────┐
-            │   Master Node        │   컨트롤 플레인 (GPU 불필요)
-            │   - kube-apiserver    │   ContainerCheckpoint feature gate
-            │   - controller/sched  │   device-plugin + 본 시스템 배포
-            └──────────┬───────────┘
-                       │ join
-        ┌──────────────┼──────────────┐
-        ▼                              ▼
-┌──────────────────┐          ┌──────────────────┐
-│  Worker Node 1   │   ...    │  Worker Node N   │   GPU 노드
-│  NVIDIA 드라이버550│          │  NVIDIA 드라이버550│   CRIU + cuda-checkpoint
-│  containerd+nvidia│          │  containerd+nvidia│   GCR hook 드라이버 배치
-│  GPU C/R Node Agent (DaemonSet가 여기서 동작)     │
-└──────────────────┘          └──────────────────┘
-```
-
-## 버전 매트릭스 (목표 기준)
+새 VM에서 시작해 실제로 GPU 체크포인트가 동작할 때까지의 **검증된** 가이드입니다.
+그동안 실제로 겪은 모든 함정을 반영했습니다. 대상 스택:
 
 | 구성요소 | 버전 |
 |----------|------|
 | OS | Ubuntu 22.04 LTS |
-| Kubernetes | v1.30.x (kubeadm/kubelet/kubectl) |
-| 컨테이너 런타임 | containerd ≥ 1.7 |
-| NVIDIA 드라이버 | ≥ 550 (`cuda-checkpoint` 포함) |
-| CRIU | ≥ 3.17 |
-| NVIDIA Container Toolkit | ≥ 1.14 |
+| Kubernetes | v1.33 (kubeadm) |
+| 컨테이너 런타임 | **CRI-O v1.33** (소켓 `/run/crio/crio.sock`) |
+| CNI | Cilium |
+| NVIDIA 드라이버 | **550** (CUDA 12.4) — 2.1/2.2 참고 |
+| CRIU | `ppa:criu/ppa` |
+| NVIDIA Container Toolkit | ≥ 1.19 |
+
+> 🇺🇸 English: [`SETUP.md`](SETUP.md)
+
+구성: **마스터 1대(GPU 불필요) + GPU 워커 N대**. 기본 클러스터는
+[GProjectdev/Kubernetes_Installer_with_CRIO](https://github.com/GProjectdev/Kubernetes_Installer_with_CRIO)
+(`k8s-masternode-setup.sh`, `k8s-workernode-setup.sh`)로 구성합니다. 아래는 그
+설치 **이후**에 하는 작업입니다.
 
 ---
 
-# Part A — 공통 베이스 (모든 노드: master + worker)
-
-Part A는 **모든** 노드에서 실행합니다.
-
-### A-1. 호스트 사전 설정
+## 1. 컨테이너 체크포인트 feature gate 활성화 (체크포인트하는 모든 노드)
 
 ```bash
-# root 진입
-sudo -i
-
-# 노드마다 고유 호스트네임 설정 (예시)
-# hostnamectl set-hostname master       # master에서
-# hostnamectl set-hostname worker-1     # 각 worker에서
-
-# 스왑 비활성화 (kubelet 필수)
-swapoff -a
-sed -i '/ swap / s/^/#/' /etc/fstab
+echo 'KUBELET_EXTRA_ARGS="--feature-gates=ContainerCheckpoint=true"' | sudo tee /etc/default/kubelet
+sudo systemctl daemon-reload && sudo systemctl restart kubelet
 ```
 
-### A-2. 커널 모듈 & sysctl
+확인 (실제 GPU 워커 이름으로; `405`/method-not-allowed = 정상):
 
 ```bash
-cat <<EOF | tee /etc/modules-load.d/k8s.conf
-overlay
-br_netfilter
-EOF
-modprobe overlay
-modprobe br_netfilter
-
-cat <<EOF | tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables  = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
-EOF
-sysctl --system
-```
-
-### A-3. containerd 설치
-
-```bash
-apt-get update
-apt-get install -y ca-certificates curl gnupg
-
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-  | tee /etc/apt/sources.list.d/docker.list
-apt-get update
-apt-get install -y containerd.io
-
-# 기본 설정 생성 + systemd cgroup 활성화 (kubeadm 필수)
-mkdir -p /etc/containerd
-containerd config default | tee /etc/containerd/config.toml >/dev/null
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-systemctl restart containerd
-systemctl enable containerd
-```
-
-### A-4. kubeadm, kubelet, kubectl 설치 (v1.30)
-
-```bash
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key \
-  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
-https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /" \
-  | tee /etc/apt/sources.list.d/kubernetes.list
-apt-get update
-apt-get install -y kubelet kubeadm kubectl
-apt-mark hold kubelet kubeadm kubectl
-```
-
-### A-5. kubelet에 `ContainerCheckpoint` feature gate 활성화
-
-체크포인트를 수행하는 모든 노드(모든 worker)에 필요합니다(master에 있어도 무해).
-
-```bash
-mkdir -p /etc/systemd/system/kubelet.service.d
-cat <<EOF | tee /etc/systemd/system/kubelet.service.d/20-checkpoint.conf
-[Service]
-Environment="KUBELET_EXTRA_ARGS=--feature-gates=ContainerCheckpoint=true"
-EOF
-systemctl daemon-reload
-# 노드 초기화/조인 후 kubelet이 자동 재시작됩니다.
+kubectl get --raw /api/v1/nodes/<gpu-worker>/proxy/checkpoint/ ; echo
 ```
 
 ---
 
-# Part B — Master 노드 전용
+## 2. GPU 워커 준비 (각 GPU 워커에서 root로)
 
-Part B는 **master에서만** 실행합니다.
+### 2.1 NVIDIA 드라이버 550 — GCC 12를 먼저 설치 (필수)
 
-### B-1. 컨트롤 플레인 초기화 (apiserver에 feature gate 포함)
-
-```bash
-# CNI에 맞는 pod 네트워크 CIDR 선택 (아래는 Calico 기본값)
-kubeadm init \
-  --pod-network-cidr=192.168.0.0/16 \
-  --feature-gates=ContainerCheckpoint=true \
-  --apiserver-extra-args feature-gates=ContainerCheckpoint=true
-```
-
-> kubeadm 버전이 `--apiserver-extra-args`를 거부하면 설정 파일 방식을 쓰세요
-> ([B-1b](#b-1b-대안-kubeadm-설정-파일)).
-
-### B-2. 사용자용 kubectl 설정
+DKMS 커널 모듈은 **커널을 빌드한 GCC와 같은 버전**으로 컴파일돼야 합니다.
+Ubuntu 22.04의 6.8 클라우드 커널(예: GCP)은 **GCC 12**로 빌드됐는데 기본 `gcc`가
+11이라 DKMS가 `unrecognized command-line option '-ftrivial-auto-var-init=zero'`로
+실패합니다.
 
 ```bash
-# 일반(비root) 사용자로:
-mkdir -p $HOME/.kube
-sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-kubectl get nodes        # master 표시 (CNI 설치 전까지 NotReady)
-```
-
-### B-3. CNI 설치 (Calico 예시)
-
-```bash
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
-kubectl get pods -n kube-system -w     # calico + coredns Running 까지 대기
-```
-
-### B-4. 조인 명령 저장 (worker용)
-
-```bash
-kubeadm token create --print-join-command
-# 출력된 `kubeadm join ...` 줄을 복사 — 각 worker에서 실행 (Part C-7)
-```
-
-### B-5. NVIDIA device plugin 설치 (클러스터 전역)
-
-```bash
-kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml
-# 권장: GPU Feature Discovery로 노드 자동 라벨링
-#   https://github.com/NVIDIA/gpu-feature-discovery
-```
-
-GPU 노드에 `nvidia.com/gpu.present=true` 라벨이 자동으로 안 붙으면 수동 라벨링
-(DaemonSet의 nodeSelector가 사용):
-
-```bash
-kubectl label node <worker-name> nvidia.com/gpu.present=true
-```
-
-### B-6. GPU C/R Node Agent 이미지 빌드 & 푸시 (Buildah)
-
-DaemonSet은 컨테이너 이미지를 실행하므로, 배포 전에 이미지를 빌드·게시해야
-합니다. Go 1.22+, gcc/make, Buildah가 있는 **빌드 호스트**(master 또는 저장소에
-접근 가능한 워크스테이션)에서 실행하세요.
-
-```bash
-# 빌드 도구 설치 (Ubuntu)
-apt-get install -y golang-go gcc make buildah
-
-# 저장소 루트에서: 에이전트 + 인터셉터 shim을 한 이미지로 빌드
-buildah bud -f Dockerfile -t ghcr.io/gprojectdev/gpu-cr-node-agent:latest .
-
-# 노드가 pull 가능한 레지스트리로 푸시
-buildah login ghcr.io                         # 사용자명 + PAT/토큰
-buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
-  docker://ghcr.io/gprojectdev/gpu-cr-node-agent:latest
-```
-
-> 이미지 이름은 `deploy/daemonset.yaml`의 `image:`와 일치해야 합니다. 다른
-> 레지스트리/이름을 쓰면 해당 필드를 수정하세요.
-
-**에어갭 / 레지스트리 없음?** 푸시 대신 OCI 아카이브로 내보내 각 GPU worker의
-containerd에 import 하세요:
-
-```bash
-# 빌드 호스트에서
-buildah push ghcr.io/gprojectdev/gpu-cr-node-agent:latest \
-  oci-archive:/tmp/gpu-cr-node-agent.tar:ghcr.io/gprojectdev/gpu-cr-node-agent:latest
-scp /tmp/gpu-cr-node-agent.tar <worker>:/tmp/
-
-# 각 GPU worker에서 — containerd가 쓰는 k8s.io 네임스페이스로 import
-ctr -n k8s.io images import /tmp/gpu-cr-node-agent.tar
-# 이후 imagePullPolicy: IfNotPresent (DaemonSet 기본값) 사용.
-```
-
-### B-7. 본 시스템 배포 (worker 조인 + 이미지 게시 후)
-
-```bash
-# 저장소 루트에서, master에서:
-kubectl apply -f config/crd/gpu-cr.io_gpucheckpoints.yaml
-kubectl apply -f deploy/rbac.yaml
-kubectl label ns gpu-cr-system pod-security.kubernetes.io/enforce=privileged --overwrite
-kubectl apply -f deploy/daemonset.yaml
-kubectl -n gpu-cr-system get pods -o wide     # GPU 노드마다 node-agent 1개
-```
-
-### B-1b. (대안) kubeadm 설정 파일
-
-extra-args 플래그가 안 되면 B-1 대신:
-
-```yaml
-# kubeadm-config.yaml
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: ClusterConfiguration
-kubernetesVersion: v1.30.0
-networking:
-  podSubnet: 192.168.0.0/16
-apiServer:
-  extraArgs:
-    feature-gates: ContainerCheckpoint=true
----
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-featureGates:
-  ContainerCheckpoint: true
-```
-
-```bash
-kubeadm init --config kubeadm-config.yaml
-```
-
----
-
-# Part C — Worker 노드 전용 (GPU 노드)
-
-Part C는 **각 GPU worker**에서 실행합니다. (이 노드에 Part A가 이미 완료돼 있어야 함)
-
-### C-1. NVIDIA 드라이버 설치 (≥ 550)
-
-> **중요 — DKMS / GCC 일치.** 드라이버 커널 모듈은 시스템 기본 `gcc`로 컴파일되며,
-> 이 `gcc`는 **현재 커널을 빌드한 GCC와 일치해야** 합니다. Ubuntu 22.04 + 6.8
-> HWE/클라우드 커널(예: GCP)은 커널이 **GCC 12**로 빌드됐는데 기본 `gcc`가 11이라,
-> DKMS 빌드가 `unrecognized command-line option '-ftrivial-auto-var-init=zero'`로
-> 실패합니다. 드라이버 설치 **전에** GCC 12를 깔고 기본으로 지정하세요.
-
-```bash
-# 0) 빌드 툴체인을 커널 컴파일러에 맞춤
 sudo apt-get update
 sudo apt-get install -y build-essential dkms gcc-12 linux-headers-$(uname -r)
 sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 60
 sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 50
 sudo update-alternatives --set gcc /usr/bin/gcc-12
-cat /proc/version          # 커널이 빌드된 GCC 버전 확인
-gcc --version              # 일치해야 함 (예: 12.x)
 
-# 1) Ubuntu 22.04용 CUDA/NVIDIA 저장소 추가
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt-get update
-
-# 2) 550 이상 드라이버 설치. A100/데이터센터 GPU는 최신 커널에서
-#    open 모듈 플레이버(nvidia-driver-550-open)를 권장합니다.
+sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update
 sudo apt-get install -y nvidia-driver-550
 sudo reboot
 ```
 
-재부팅 후 모듈 빌드/로드와 GPU 인식 확인:
+재부팅 후:
 
 ```bash
-sudo dkms status           # nvidia/550.x, <kernel>: installed   ("added"가 아니라)
-sudo modprobe nvidia
-nvidia-smi                 # GPU + 드라이버 550.x 표시
+sudo dkms status     # nvidia/550.x, <kernel>: installed  ("added" 아님)
+nvidia-smi           # GPU + 드라이버 550.x
 ```
 
-> `dkms status`가 `installed`가 아니라 `added`이거나, `nvidia-smi`가 "couldn't
-> communicate with the NVIDIA driver"라면 커널 모듈이 빌드되지 않은 것입니다.
-> 대부분 위 GCC 불일치가 원인이며(트러블슈팅 참고), gcc를 고친 뒤
-> `sudo dkms install nvidia/<ver> -k $(uname -r) --force`로 재빌드하면 됩니다.
+`added`만 뜨거나 "couldn't communicate"면 모듈 미빌드 → gcc 고친 뒤
+`sudo dkms install nvidia/<ver> -k $(uname -r) --force`.
 
-### C-1b. `cuda-checkpoint` 바이너리 설치
-
-apt 드라이버 패키지는 `cuda-checkpoint`를 `PATH`에 넣어주지 않습니다. NVIDIA의
-prebuilt 바이너리를 설치하세요(드라이버가 정상이어야 함):
+### 2.2 cuda-checkpoint 바이너리 (apt로는 PATH에 없음)
 
 ```bash
 git clone https://github.com/NVIDIA/cuda-checkpoint.git
-ls cuda-checkpoint/bin/                                    # x86_64 빌드 디렉토리 확인
 sudo install -m 0755 cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/bin/cuda-checkpoint
 cuda-checkpoint --help
 ```
 
-### C-2. NVIDIA Container Toolkit 설치
+### 2.3 NVIDIA Container Toolkit + CRIU + CRI-O 드롭인 하나
 
 ```bash
+# Toolkit
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
   | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-apt-get update
-apt-get install -y nvidia-container-toolkit
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 
-# containerd에 NVIDIA 런타임 연동 + 기본 런타임으로 설정
-nvidia-ctk runtime configure --runtime=containerd --set-as-default
-systemctl restart containerd
-```
-
-### C-3. CRIU 설치 (≥ 3.17)
-
-```bash
-apt-get install -y criu
-criu --version
-criu check                       # "Looks good." 기대
-```
-
-> 배포판 CRIU가 3.17보다 낮으면 소스 빌드: <https://criu.org/Installation>
-
-### C-4. 인터셉터 라이브러리 / 런타임 디렉토리 준비
-
-```bash
-mkdir -p /var/lib/gpu-cr/lib /var/lib/gpu-cr/run /var/lib/gcr-checkpoint
-# Node Agent가 시작 시 libgcr-interceptor.so를 여기 설치합니다.
-```
-
-### C-5. GCR hook 드라이버(`libcuda.so`) 빌드 & 배치
-
-선택적 `cuMem*` 인터셉션 드라이버는 업스트림에서 빌드:
-
-```bash
-git clone https://github.com/thustorage/GCR.git
-cd GCR/GCR
-bash build.sh                    # libcuda.so 생성 (업스트림 README 참고)
-cp libcuda.so /var/lib/gpu-cr/lib/libcuda.so
-```
-
-> 이 파일이 없으면 인터셉터 shim이 실제 드라이버로 폴백하여 GPU 측 체크포인트가
-> 동작하지 않습니다. (dry-run으로 오케스트레이션은 테스트 가능)
-
-### C-6. kubelet feature gate 확인 (A-5에서 설정)
-
-```bash
-cat /etc/systemd/system/kubelet.service.d/20-checkpoint.conf   # ContainerCheckpoint=true 포함돼야 함
-```
-
-### C-7. 클러스터 조인
-
-```bash
-# B-4에서 master가 출력한 join 명령 붙여넣기:
-kubeadm join <MASTER_IP>:6443 --token <token> \
-  --discovery-token-ca-cert-hash sha256:<hash>
-
-# 조인 후 kubelet이 feature gate를 반영하도록:
-systemctl restart kubelet
-```
-
-### C-8. master에서 확인
-
-```bash
-kubectl get nodes -o wide                          # worker Ready
-kubectl describe node <worker> | grep nvidia.com/gpu   # nvidia.com/gpu: 1
-```
-
----
-
-# Part D — 엔드투엔드 스모크 테스트
-
-모두 올라온 뒤 master에서:
-
-```bash
-# 1. GCR 인터셉션이 연결된 GPU 워크로드 실행
-kubectl apply -f deploy/sample-pod.yaml
-
-# 2. deploy/sample-gpucheckpoint.yaml의 podRef.nodeInfo를 worker 이름으로 설정 후
-#    체크포인트 요청
-kubectl apply -f deploy/sample-gpucheckpoint.yaml
-
-# 3. CR 상태 갱신 확인 (Phase -> Completed, period마다 Count 증가)
-kubectl get gpucheckpoints -w
-
-# 4. worker에서 생성된 아카이브 확인
-ssh <worker> 'ls -lh /var/lib/gcr-checkpoint/'
-```
-
-### 사전 점검 체크리스트 (worker에서)
-
-```bash
-nvidia-smi -L
-cuda-checkpoint --help
-criu check
-ls /run/containerd/containerd.sock
-ls /var/lib/gpu-cr/lib/libcuda.so
-kubectl version            # (master에서) 서버 >= v1.30
-```
-
-### Dry-run (GPU 없는 환경)
-
-`deploy/daemonset.yaml`의 `--dry-run=true`(이미 인자로 존재)로 설정하면 드라이버/
-CRIU 없이 reconcile 루프, CR 상태 갱신, 스토리지 레이아웃을 검증할 수 있습니다.
-
----
-
-# 부록 — CRI-O 클러스터 (예: GProjectdev installer)
-
-위 Part A–C는 **containerd** 기준입니다. 클러스터가 **CRI-O**(소켓
-`/var/run/crio/crio.sock`,
-[Kubernetes_Installer_with_CRIO](https://github.com/GProjectdev/Kubernetes_Installer_with_CRIO)
-구성)라면 아래 차이를 적용하세요.
-
-### CRI-O-1. 에이전트를 CRI-O 소켓에 맞추기
-
-`deploy/daemonset.yaml`의 **소켓 3곳**과 env를 CRI-O로 바꾼 뒤 재적용:
-
-```bash
-sed -i 's#/run/containerd/containerd.sock#/var/run/crio/crio.sock#g' deploy/daemonset.yaml
-kubectl apply -f deploy/daemonset.yaml
-kubectl -n gpu-cr-system set env ds/gpu-cr-node-agent \
-  CONTAINER_RUNTIME_ENDPOINT=unix:///var/run/crio/crio.sock
-```
-
-> 안 하면 에이전트 Pod가
-> `hostPath type check failed: /run/containerd/containerd.sock is not a socket file`
-> 로 막힙니다.
-
-### CRI-O-2. CRIU + runc 런타임 (체크포인트 지원)
-
-CRI-O는 CRIU만 있으면 체크포인트/복원을 자동 활성화합니다 — `enable_criu_support`는
-**필요 없습니다**(최신 CRI-O에서 유효하지 않은 키라 crio가 시작에 실패함). CRIU + runc를
-설치하고 `runc` 런타임을 정의하세요:
-
-```bash
+# CRIU + runc
 sudo add-apt-repository -y ppa:criu/ppa && sudo apt-get update
 sudo apt-get install -y criu runc
-sudo criu check                         # "Looks good."
-which runc                              # 보통 /usr/sbin/runc
+sudo criu check     # "Looks good."
+```
 
-sudo tee /etc/crio/crio.conf.d/99-runc.conf >/dev/null <<'EOF'
+**CRI-O 드롭인 하나**로 세 가지를 동시에 처리합니다:
+- **nvidia 런타임을 기본 런타임으로** (그래야 NVIDIA device plugin이 GPU를 인식해
+  `nvidia.com/gpu`를 광고),
+- **runc** 런타임 정의,
+- 둘 다 `monitor_path` 지정 (없으면 crio 1.33이
+  `failed to translate monitor fields for runtime nvidia: "conmon" not found`로 죽음).
+
+CRIU 체크포인트는 `criu`만 있으면 자동 활성화됩니다 — 제거된 `enable_criu_support`
+키는 넣지 마세요(crio가 죽습니다).
+
+```bash
+sudo tee /etc/crio/crio.conf.d/99-gpu-cr.conf >/dev/null <<'CONF'
 [crio.runtime]
-default_runtime = "runc"
+default_runtime = "nvidia"
+
+[crio.runtime.runtimes.nvidia]
+runtime_path = "/usr/bin/nvidia-container-runtime"
+runtime_type = "oci"
+monitor_path = "/usr/libexec/crio/conmon"
 
 [crio.runtime.runtimes.runc]
 runtime_path = "/usr/sbin/runc"
 runtime_type = "oci"
 runtime_root = "/run/runc"
-EOF
-sudo systemctl restart crio
-sudo systemctl status crio --no-pager   # active (running)
-```
-
-### CRI-O-3. CRI-O에서 NVIDIA GPU — 커스텀 런타임 대신 CDI
-
-`nvidia-ctk runtime configure --runtime=crio`는 `nvidia` 런타임 드롭인을 만드는데,
-CRI-O 1.33에서 **crio를 죽입니다**(`failed to translate monitor fields for runtime
-nvidia: "conmon" not found in $PATH`). **CDI**를 권장:
-
-```bash
-# 위 명령으로 만든 깨진 nvidia 런타임 드롭인 제거
+monitor_path = "/usr/libexec/crio/conmon"
+CONF
 sudo rm -f /etc/crio/crio.conf.d/99-nvidia.toml
-sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-nvidia-ctk cdi list
 sudo systemctl restart crio
+sudo systemctl is-active crio        # active
 ```
 
-> 커스텀 런타임을 굳이 유지하려면 제거 대신 `[crio.runtime.runtimes.nvidia]` 블록에
-> `monitor_path = "/usr/libexec/crio/conmon"`를 추가하세요.
+### 2.4 스토리지 — 컨테이너 저장소 + pull 임시물을 큰 디스크로
 
-### CRI-O-4. 노드 스토리지 / DiskPressure
-
-클라우드 이미지는 작은(~10GB) 루트 디스크로 부팅되고 큰 데이터 디스크는 **마운트되지
-않은 채** 방치되는 경우가 많습니다. 그러면 CRI-O 이미지 스토리지(`/var/lib/containers`)가
-루트를 가득 채워 kubelet이 `DiskPressure`로 Pod를 쫓아냅니다. 데이터 디스크를 컨테이너
-스토리지로 마운트하세요:
+클라우드 VM은 작은(~10GB) 루트 + 큰 **미마운트** 데이터 디스크인 경우가 많아,
+CRI-O 이미지 저장소가 루트를 채워 `DiskPressure`로 evict되고 pull이
+`/var/tmp ... no space left on device`로 실패합니다.
 
 ```bash
-lsblk ; df -h /                          # 큰 디스크(예: /dev/sdb)가 미마운트인가?
+lsblk ; df -h /                          # 미마운트 큰 디스크 확인 (예: /dev/sdb)
 sudo systemctl stop kubelet crio
 sudo umount -R /var/lib/containers/storage/overlay 2>/dev/null || true
-sudo mkfs.ext4 -F /dev/sdb               # 디스크가 비었을 때만 (blkid 출력 없음)
-sudo mv /var/lib/containers /var/lib/containers.bak
+sudo blkid /dev/sdb                      # mkfs 전 비어있는지 (출력 없음)
+sudo mkfs.ext4 -F /dev/sdb
+sudo mv /var/lib/containers /var/lib/containers.bak 2>/dev/null || true
 sudo mkdir -p /var/lib/containers
 echo '/dev/sdb /var/lib/containers ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
 sudo mount /var/lib/containers
+sudo rm -rf /var/lib/containers.bak      # 루트 공간 회수 (DiskPressure 해소 핵심)
+
+# pull 임시물(/var/tmp)도 루트에 있음 → 큰 디스크로 bind
+sudo mkdir -p /var/lib/containers/vartmp
+grep -q '/var/lib/containers/vartmp /var/tmp ' /etc/fstab || \
+  echo '/var/lib/containers/vartmp /var/tmp none bind 0 0' | sudo tee -a /etc/fstab
+sudo mount /var/tmp
 sudo systemctl start crio kubelet
-sudo rm -rf /var/lib/containers.bak      # 루트 공간 회수 (이게 DiskPressure를 푸는 핵심)
-df -h / /var/lib/containers
+df -h / /var/lib/containers /var/tmp
+```
+
+### 2.5 GPU C/R 런타임 디렉토리
+
+```bash
+sudo mkdir -p /var/lib/gpu-cr/lib /var/lib/gpu-cr/run /var/lib/gcr-checkpoint
 ```
 
 ---
 
-# 트러블슈팅
+## 3. 마스터: device plugin, 라벨, 시스템 배포
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.15.0/deployments/static/nvidia-device-plugin.yml
+kubectl label node <gpu-worker> nvidia.com/gpu.present=true --overwrite
+kubectl -n kube-system rollout restart ds/nvidia-device-plugin-daemonset
+kubectl get node <gpu-worker> -o jsonpath='{.status.capacity.nvidia\.com/gpu}{"\n"}'   # -> 1
+```
+
+---
+
+## 4. 에이전트 이미지 빌드·게시 (Go 1.22+, gcc/make, buildah 있는 빌드 호스트)
+
+```bash
+cd K8s-Native-Fast-GPU-Checkpoint-Restore-System
+buildah bud -f Dockerfile -t docker.io/<you>/gpu-cr-node-agent:v1.2 .
+buildah login docker.io
+buildah push docker.io/<you>/gpu-cr-node-agent:v1.2 docker://docker.io/<you>/gpu-cr-node-agent:v1.2
+```
+
+> 인터셉터/에이전트 코드가 바뀌면 **새 태그로 재빌드**하세요. 에이전트는 시작 시
+> 자신에 포함된 `libgcr-interceptor.so`를 노드에 설치하므로, 옛 이미지 = 옛 인터셉터.
+
+---
+
+## 5. 시스템 배포 (마스터)
+
+```bash
+kubectl apply -f config/crd/gpu-cr.io_gpucheckpoints.yaml
+kubectl apply -f deploy/rbac.yaml
+kubectl label ns gpu-cr-system pod-security.kubernetes.io/enforce=privileged --overwrite
+
+# deploy/daemonset-crio.yaml 의 image를 docker.io/<you>/gpu-cr-node-agent:v1.2 로 수정
+kubectl apply -f deploy/daemonset-crio.yaml
+kubectl -n gpu-cr-system get po -o wide        # GPU 노드마다 1/1 Running
+kubectl -n gpu-cr-system logs ds/gpu-cr-node-agent --tail=20
+```
+
+---
+
+## 6. GPU 워크로드 실행 + 체크포인트 요청
+
+[`deploy/sample-pod.yaml`](../deploy/sample-pod.yaml)을 사용하세요 — 드라이버 550
+호환 PyTorch 워크로드 **와 인터셉터가 필요로 하는 제어채널 연결**(`GCR_POD_UID`,
+`GCR_CONTROL_DIR`, `/var/lib/gpu-cr/run` 마운트)이 포함돼 있습니다. 이것이 없는 Pod
+매니페스트(예: 옛 `sample.yaml`)를 쓰면 인터셉터가 ACK하지 못해 step 1에서
+타임아웃됩니다.
+
+```bash
+kubectl apply -f deploy/sample-pod.yaml
+kubectl get po vllm-gcr-pod -o wide
+kubectl logs vllm-gcr-pod | grep -E 'GPU tensor allocated|\[gcr\]'
+#   GPU tensor allocated ...
+#   [gcr] interceptor loaded (pid=...): watching /var/lib/gpu-cr/run/<uid>/control
+```
+
+체크포인트 CR([`deploy/sample-gpucheckpoint.yaml`](../deploy/sample-gpucheckpoint.yaml));
+`container`는 Pod 컨테이너명(`cuda-app`)과 일치, `period: "000000"` = 1회:
+
+```bash
+kubectl apply -f deploy/sample-gpucheckpoint.yaml
+kubectl get gpucheckpoints -w        # Checkpointing -> Completed
+kubectl -n gpu-cr-system logs -l app.kubernetes.io/name=gpu-cr-node-agent --tail=80 -f
+```
+
+기대 파이프라인(에이전트+Pod 로그):
+- agent `checkpoint start` → pod `[gcr] checkpoint signal received` → `intercepted-info dumped` → `ACK sent`
+- agent `step 1/5 done` → `step 2/5 cuda-checkpoint` → `step 3/5 kubelet produced` → `step 4/5 stored`
+
+---
+
+## 7. 결과 검증
+
+```bash
+kubectl describe gpucheckpoint ckpt-vllm-001 | tail
+ls -lh /var/lib/gcr-checkpoint/                    # checkpoint-*.tar (워커)
+cat /var/lib/gpu-cr/run/*/intercepted-info         # 가로챈 GPU 버퍼
+```
+
+---
+
+## 8. 트러블슈팅 (겪은 것 전부)
 
 | 증상 | 원인 / 해결 |
 |------|-------------|
-| `kubelet checkpoint returned 404/feature` | kubelet **과** apiserver에 `ContainerCheckpoint` gate 미활성화. A-5 / B-1 재확인. |
-| `criu check` 실패 | CRIU가 너무 오래됐거나 커널 옵션 부족; 소스로 ≥ 3.17 빌드. |
-| Pod가 GPU를 못 봄 | NVIDIA 드라이버/툴킷 미설치 또는 컨테이너 런타임(containerd/CRI-O) 미구성 (C-1/C-2). |
-| node-agent가 스케줄 안 됨 | 노드에 `nvidia.com/gpu.present=true` 라벨 없음 (B-5) 또는 PodSecurity가 privileged 차단 (B-6 라벨). |
-| `nvidia-smi` "couldn't communicate" / `dkms status` = `added` | DKMS 모듈 빌드 실패 — 보통 GCC 불일치. `gcc-12` 설치 후 `update-alternatives --set gcc /usr/bin/gcc-12`, 이어서 `dkms install nvidia/<ver> -k $(uname -r) --force` (C-1). |
-| `unrecognized command-line option '-ftrivial-auto-var-init=zero'` | 기본 `gcc`가 커널 빌드 GCC보다 낮음. 드라이버 빌드 전에 `gcc-12` 설치/선택 (C-1). |
-| `cuda-checkpoint: command not found` | 바이너리가 PATH에 없음; github.com/NVIDIA/cuda-checkpoint의 prebuilt 바이너리 설치 (C-1b). 드라이버 정상 필요. |
-| GPU 측 체크포인트 안 됨 | GCR hook `libcuda.so`가 `/var/lib/gpu-cr/lib/`에 없음 (C-5). |
-| 에이전트 Pod: `hostPath type check failed: ...containerd.sock is not a socket` | 노드가 CRI-O인데 containerd 소켓을 마운트함. daemonset 소켓 + `CONTAINER_RUNTIME_ENDPOINT`를 `/var/run/crio/crio.sock`로 (부록 CRI-O-1). |
-| 에이전트 Pod `Evicted: node had condition [DiskPressure]` | 컨테이너 스토리지가 작은 루트 디스크에 있음. 데이터 디스크를 `/var/lib/containers`로 마운트하고 `.bak` 제거 (부록 CRI-O-4). |
-| crio 시작 실패: `failed to translate monitor fields for runtime nvidia: "conmon" not found` | `nvidia-ctk runtime configure --runtime=crio`가 만든 깨진 nvidia 런타임 드롭인. 제거 후 CDI 사용 또는 `monitor_path` 추가 (부록 CRI-O-3). |
-| `crio.conf.d` 수정 후 crio 시작 실패 | 드롭인이 정의 없는 런타임을 참조하거나 `enable_criu_support` 같은 모르는 키 사용. `journalctl -xeu crio | tail` 확인, 최소 runc 드롭인 사용 (부록 CRI-O-2). |
+| `nvidia-smi` "couldn't communicate" / `dkms status` = `added` | DKMS 미빌드. GCC 불일치 — gcc-12 설치/기본설정 후 `dkms install ... --force` (2.1). |
+| `unrecognized option '-ftrivial-auto-var-init=zero'` | 기본 gcc가 커널 빌드 GCC보다 낮음 → gcc-12 (2.1). |
+| `cuda-checkpoint: command not found` | `NVIDIA/cuda-checkpoint` prebuilt 설치 (2.2). |
+| crio 시작 실패 `... runtime nvidia: "conmon" not found` | nvidia 런타임에 `monitor_path` 누락 → 2.3의 99-gpu-cr.conf 사용. |
+| `crio.conf.d` 편집 후 crio 시작 실패 | 모르는 키(`enable_criu_support`)나 정의 없는 런타임 → `journalctl -xeu crio | tail`; 2.3 드롭인. |
+| `0/N nodes ... Insufficient nvidia.com/gpu` | device plugin이 GPU 못 봄 → nvidia를 CRI-O 기본 런타임으로 (2.3) + device plugin 재시작 (3). |
+| agent Pod `hostPath ...containerd.sock is not a socket` | 노드가 CRI-O → `deploy/daemonset-crio.yaml`(소켓 디렉토리 `/run/crio`). |
+| agent CrashLoop `listen :8081: address already in use` | hostNetwork 포트 충돌 → metrics/health :9290/:9291 (daemonset-crio 기본). |
+| crictl이 기본 엔드포인트 3개 시도 / `connection refused` | `CONTAINER_RUNTIME_ENDPOINT` 미설정 또는 소켓 "파일" 마운트 → daemonset-crio는 `/run/crio` 디렉토리 마운트 + 엔드포인트 설정. |
+| Pod `Evicted: DiskPressure` / pull `no space left on device` (`/var/tmp`) | 루트 디스크 가득 → 데이터 디스크를 `/var/lib/containers`에 마운트 + `/var/tmp` bind (2.4). |
+| vllm 엔진 init 실패 "driver too old / pytorch.org" | 이미지 CUDA가 드라이버 550보다 최신 → CUDA ≤12.4 이미지 사용(sample-pod는 pytorch cu121). |
+| `data-buffer checkpoint did not ack: timeout ... /run/<uid>/control` | Pod에 제어채널 연결 없음 또는 옛 에이전트 이미지 → `deploy/sample-pod.yaml`(UID+`/var/lib/gpu-cr/run` 마운트) + 현재 코드로 빌드한 에이전트 이미지 사용. |
+| `resolve container pid: no running container <name>` | CR `podRef.container`가 Pod 컨테이너명과 불일치. |
