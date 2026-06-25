@@ -40,6 +40,10 @@ type Checkpointer struct {
 	// DryRun skips the privileged host operations (for dev clusters without GPUs);
 	// the control flow, status updates and storage layout still run end-to-end.
 	DryRun bool
+	// GCRInterception gates step 1 (selective data-buffer checkpoint via the
+	// in-Pod GCR hook). Set false when the upstream GCR hook (libcuda.so) is not
+	// wired up; the pipeline then relies on cuda-checkpoint + CRIU only.
+	GCRInterception bool
 
 	run commandRunner
 }
@@ -59,6 +63,7 @@ func NewCheckpointer(im *InterceptorManager, kc *KubeletClient, dryRun bool) *Ch
 		CudaCheckpointBin: "cuda-checkpoint",
 		CrictlBin:         "crictl",
 		DryRun:            dryRun,
+		GCRInterception:   true,
 		run:               defaultRunner,
 	}
 }
@@ -87,17 +92,20 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 	klog.Infof("checkpoint start: pod=%s/%s container=%s pid=%d incremental=%t",
 		t.Namespace, t.Pod, t.Container, t.HostPID, t.Incremental)
 
-	// (1) Selective data-buffer checkpoint via the GCR hook.
-	sig := GCRSignalCkpt
-	if err := c.Interceptor.Signal(t.PodUID, sig); err != nil {
-		return nil, fmt.Errorf("signal GCR data-buffer checkpoint: %w", err)
-	}
-	if !c.DryRun {
-		if err := c.Interceptor.WaitForAck(t.PodUID, 90*time.Second); err != nil {
-			return nil, fmt.Errorf("data-buffer checkpoint did not ack: %w", err)
+	// (1) Selective data-buffer checkpoint via the GCR hook (optional).
+	if c.GCRInterception {
+		if err := c.Interceptor.Signal(t.PodUID, GCRSignalCkpt); err != nil {
+			return nil, fmt.Errorf("signal GCR data-buffer checkpoint: %w", err)
 		}
+		if !c.DryRun {
+			if err := c.Interceptor.WaitForAck(t.PodUID, 90*time.Second); err != nil {
+				return nil, fmt.Errorf("data-buffer checkpoint did not ack: %w", err)
+			}
+		}
+		klog.V(2).Info("step 1/5 done: GPU data buffers checkpointed, physical memory released")
+	} else {
+		klog.V(2).Info("step 1/5 skipped: GCR interception disabled; using cuda-checkpoint + CRIU only")
 	}
-	klog.V(2).Info("step 1/5 done: GPU data buffers checkpointed, physical memory released")
 
 	// (2) Control-state checkpoint: suspend CUDA via cuda-checkpoint.
 	if err := c.cudaToggle(ctx, t.HostPID); err != nil {
@@ -132,7 +140,9 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 	if err := c.cudaToggle(ctx, t.HostPID); err != nil {
 		klog.Errorf("resume after checkpoint failed (job may be suspended): %v", err)
 	}
-	_ = c.Interceptor.Signal(t.PodUID, GCRSignalIdle)
+	if c.GCRInterception {
+		_ = c.Interceptor.Signal(t.PodUID, GCRSignalIdle)
+	}
 	klog.Infof("step 5/5 done: workload resumed; checkpoint took %s", time.Since(start))
 
 	return &Result{ArchivePath: stored, TakenAt: start}, nil

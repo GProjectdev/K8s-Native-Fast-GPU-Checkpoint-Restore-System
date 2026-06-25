@@ -99,6 +99,9 @@ func main() {
 	if v := os.Getenv("CRICTL_BIN"); v != "" {
 		cp.CrictlBin = v
 	}
+	if os.Getenv("GCR_INTERCEPTION") == "false" {
+		cp.GCRInterception = false
+	}
 	r := &agent.Reconciler{
 		Client:       mgr.GetClient(),
 		NodeName:     nodeName,
