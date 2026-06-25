@@ -1,6 +1,6 @@
 # Example GPU Pod wired for GCR selective interception.
 # Mirrors the "Pod example" in the DCN Progress Report: the workload LD_PRELOADs
-# the interceptor shim from the host-installed library directory.
+# the interceptor shim, and shares the control channel dir with the Node Agent.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -10,16 +10,29 @@ metadata:
     app: vllm-gcr
 spec:
   containers:
-    - name: vllm
-      image: vllm/vllm-openai:latest
-      args: ["--model", "facebook/opt-1.3b"]
+    - name: cuda-app
+      # CUDA 12.1 build → compatible with NVIDIA driver 550 (CUDA 12.4).
+      image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+      command: ["python", "-c"]
+      args:
+        - |
+          import torch, time
+          assert torch.cuda.is_available(), "CUDA not available"
+          x = torch.randn(2048, 2048, 256, device='cuda')   # ~4GB GPU memory
+          print("GPU tensor allocated:", x.shape, "device:", x.device, flush=True)
+          while True:
+              time.sleep(3600)
       env:
-        # Load the selective CUDA interceptor before the CUDA runtime.
         - name: LD_PRELOAD
           value: /opt/gpu-cr/libgcr-interceptor.so
-        # Directory that contains libgcr-interceptor.so and the GCR hook libcuda.so.
         - name: GCR_HOME
           value: /opt/gpu-cr
+        - name: GCR_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: GCR_CONTROL_DIR
+          value: /var/lib/gpu-cr/run
       resources:
         limits:
           nvidia.com/gpu: "1"
@@ -27,9 +40,14 @@ spec:
         - name: gpu-cr-lib
           mountPath: /opt/gpu-cr
           readOnly: true
+        - name: gpu-cr-run
+          mountPath: /var/lib/gpu-cr/run
   volumes:
-    # Provided by the Node Agent (it installs the library into /var/lib/gpu-cr/lib).
     - name: gpu-cr-lib
       hostPath:
         path: /var/lib/gpu-cr/lib
         type: Directory
+    - name: gpu-cr-run
+      hostPath:
+        path: /var/lib/gpu-cr/run
+        type: DirectoryOrCreate

@@ -1,16 +1,15 @@
-# Builds the LD_PRELOAD interception shim.
+# Builds the LD_PRELOAD selective CUDA-interception library.
 #
 #   make            -> libgcr-interceptor.so
 #   make install DESTDIR=/var/lib/gpu-cr/lib
 #
-# NOTE: The GCR *hook driver* (libcuda.so) that performs the actual selective
-# cuMem* interception must be built from the upstream repo
-# (https://github.com/thustorage/GCR, GCR/build.sh) and placed next to this
-# shim. This Makefile only builds the dlopen shim.
+# This is a self-contained interceptor (no CUDA toolkit/headers required): it
+# interposes the CUDA memory APIs and runs a control-channel watcher that ACKs
+# the Node Agent's checkpoint request and dumps the intercepted buffer info.
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -fPIC -Wall -Wextra
-LDFLAGS ?= -shared -ldl
+LDFLAGS ?= -shared -ldl -lpthread
 TARGET   = libgcr-interceptor.so
 DESTDIR ?= /var/lib/gpu-cr/lib
 

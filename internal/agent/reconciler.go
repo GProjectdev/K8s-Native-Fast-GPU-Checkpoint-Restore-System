@@ -35,28 +35,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Resolve the target node. The CR carries nodeInfo per the DCN design, so the
-	// Node Agent can act directly on the CR without any separate controller.
-	targetNode := cr.Spec.PodRef.NodeInfo
-	container := cr.Spec.PodRef.Container
-	var podUID string
-	if targetNode == "" || container == "" {
-		var pod corev1.Pod
-		key := types.NamespacedName{Namespace: cr.Spec.PodRef.Namespace, Name: cr.Spec.PodRef.Name}
-		if err := r.Get(ctx, key, &pod); err != nil {
-			if apierrors.IsNotFound(err) {
-				return r.fail(ctx, &cr, "target Pod not found")
-			}
-			return ctrl.Result{}, err
+	// Always resolve the Pod: the interceptor control channel is keyed by the
+	// Pod UID, and node/container are filled from the Pod when the CR omits them.
+	var pod corev1.Pod
+	key := types.NamespacedName{Namespace: cr.Spec.PodRef.Namespace, Name: cr.Spec.PodRef.Name}
+	if err := r.Get(ctx, key, &pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.fail(ctx, &cr, "target Pod not found")
 		}
-		if targetNode == "" {
-			targetNode = pod.Spec.NodeName
-		}
-		if container == "" && len(pod.Spec.Containers) > 0 {
-			container = pod.Spec.Containers[0].Name
-		}
-		podUID = string(pod.UID)
+		return ctrl.Result{}, err
 	}
+	targetNode := cr.Spec.PodRef.NodeInfo
+	if targetNode == "" {
+		targetNode = pod.Spec.NodeName
+	}
+	container := cr.Spec.PodRef.Container
+	if container == "" && len(pod.Spec.Containers) > 0 {
+		container = pod.Spec.Containers[0].Name
+	}
+	podUID := string(pod.UID)
 
 	// Only the agent on the target node proceeds.
 	if targetNode != r.NodeName {
