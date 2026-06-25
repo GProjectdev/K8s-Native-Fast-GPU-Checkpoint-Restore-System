@@ -1,6 +1,4 @@
-# Example GPU Pod wired for GCR selective interception.
-# Mirrors the "Pod example" in the DCN Progress Report: the workload LD_PRELOADs
-# the interceptor shim, and shares the control channel dir with the Node Agent.
+# Example GPU Pod wired for GCR selective interception + real data-buffer copy.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -33,6 +31,9 @@ spec:
               fieldPath: metadata.uid
         - name: GCR_CONTROL_DIR
           value: /var/lib/gpu-cr/run
+        # Big-disk storage where the interceptor writes the data-buffer copy.
+        - name: GCR_DATA_DIR
+          value: /var/lib/gcr-checkpoint
       resources:
         limits:
           nvidia.com/gpu: "1"
@@ -42,6 +43,8 @@ spec:
           readOnly: true
         - name: gpu-cr-run
           mountPath: /var/lib/gpu-cr/run
+        - name: gcr-checkpoint
+          mountPath: /var/lib/gcr-checkpoint
   volumes:
     - name: gpu-cr-lib
       hostPath:
@@ -50,4 +53,8 @@ spec:
     - name: gpu-cr-run
       hostPath:
         path: /var/lib/gpu-cr/run
+        type: DirectoryOrCreate
+    - name: gcr-checkpoint
+      hostPath:
+        path: /var/lib/gcr-checkpoint
         type: DirectoryOrCreate
