@@ -428,6 +428,94 @@ reconcile loop, CR status updates, and storage layout without driver/CRIU.
 
 ---
 
+# Appendix — CRI-O clusters (e.g. the GProjectdev installer)
+
+Parts A–C above assume **containerd**. If your cluster runs **CRI-O** (socket
+`/var/run/crio/crio.sock`, as the
+[Kubernetes_Installer_with_CRIO](https://github.com/GProjectdev/Kubernetes_Installer_with_CRIO)
+sets up), apply these differences.
+
+### CRI-O-1. Point the agent at the CRI-O socket
+
+In `deploy/daemonset.yaml` change **all three** socket references and the env to
+CRI-O, then re-apply:
+
+```bash
+sed -i 's#/run/containerd/containerd.sock#/var/run/crio/crio.sock#g' deploy/daemonset.yaml
+kubectl apply -f deploy/daemonset.yaml
+kubectl -n gpu-cr-system set env ds/gpu-cr-node-agent \
+  CONTAINER_RUNTIME_ENDPOINT=unix:///var/run/crio/crio.sock
+```
+
+> Symptom if skipped: agent Pod stuck with
+> `hostPath type check failed: /run/containerd/containerd.sock is not a socket file`.
+
+### CRI-O-2. CRIU + runc runtime (checkpoint support)
+
+CRI-O enables checkpoint/restore automatically when CRIU is present — you do
+**not** need `enable_criu_support` (it is not a valid key on recent CRI-O and
+makes crio fail to start). Install CRIU + runc and define a `runc` runtime:
+
+```bash
+sudo add-apt-repository -y ppa:criu/ppa && sudo apt-get update
+sudo apt-get install -y criu runc
+sudo criu check                         # "Looks good."
+which runc                              # usually /usr/sbin/runc
+
+sudo tee /etc/crio/crio.conf.d/99-runc.conf >/dev/null <<'EOF'
+[crio.runtime]
+default_runtime = "runc"
+
+[crio.runtime.runtimes.runc]
+runtime_path = "/usr/sbin/runc"
+runtime_type = "oci"
+runtime_root = "/run/runc"
+EOF
+sudo systemctl restart crio
+sudo systemctl status crio --no-pager   # active (running)
+```
+
+### CRI-O-3. NVIDIA GPUs on CRI-O — use CDI, not a custom runtime
+
+`nvidia-ctk runtime configure --runtime=crio` writes a `nvidia` runtime drop-in
+that **breaks crio** on 1.33 (`failed to translate monitor fields for runtime
+nvidia: "conmon" not found in $PATH`). Prefer **CDI**:
+
+```bash
+# remove the broken nvidia runtime drop-in if you ran the command above
+sudo rm -f /etc/crio/crio.conf.d/99-nvidia.toml
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+nvidia-ctk cdi list
+sudo systemctl restart crio
+```
+
+> If you must keep the custom runtime, add
+> `monitor_path = "/usr/libexec/crio/conmon"` to the `[crio.runtime.runtimes.nvidia]`
+> block instead of removing it.
+
+### CRI-O-4. Node storage / DiskPressure
+
+Cloud images often boot a small (~10 GB) root disk while a large data disk sits
+**unmounted**, so CRI-O image storage (`/var/lib/containers`) fills the root and
+the kubelet evicts Pods with `DiskPressure`. Mount the data disk for container
+storage:
+
+```bash
+lsblk ; df -h /                          # is the big disk (e.g. /dev/sdb) unmounted?
+sudo systemctl stop kubelet crio
+sudo umount -R /var/lib/containers/storage/overlay 2>/dev/null || true
+sudo mkfs.ext4 -F /dev/sdb               # ONLY if the disk is empty (blkid shows nothing)
+sudo mv /var/lib/containers /var/lib/containers.bak
+sudo mkdir -p /var/lib/containers
+echo '/dev/sdb /var/lib/containers ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
+sudo mount /var/lib/containers
+sudo systemctl start crio kubelet
+sudo rm -rf /var/lib/containers.bak      # reclaim the root space (this is what clears DiskPressure)
+df -h / /var/lib/containers
+```
+
+---
+
 # Troubleshooting
 
 | Symptom | Likely cause / fix |
@@ -440,3 +528,7 @@ reconcile loop, CR status updates, and storage layout without driver/CRIU.
 | `unrecognized command-line option '-ftrivial-auto-var-init=zero'` | Default `gcc` older than the kernel's build GCC. Install & select `gcc-12` before building the driver (C-1). |
 | `cuda-checkpoint: command not found` | Binary not on PATH; install the prebuilt binary from github.com/NVIDIA/cuda-checkpoint (C-1b). Requires a working driver. |
 | No GPU-side checkpoint | GCR hook `libcuda.so` not staged in `/var/lib/gpu-cr/lib/` (C-5). |
+| agent Pod: `hostPath type check failed: ...containerd.sock is not a socket` | Node runs CRI-O, not containerd. Point the daemonset socket + `CONTAINER_RUNTIME_ENDPOINT` at `/var/run/crio/crio.sock` (Appendix CRI-O-1). |
+| agent Pod `Evicted: node had condition [DiskPressure]` | Container storage on a small root disk. Mount the data disk at `/var/lib/containers` and remove the old `.bak` (Appendix CRI-O-4). |
+| crio won't start: `failed to translate monitor fields for runtime nvidia: "conmon" not found` | Broken `nvidia` runtime drop-in from `nvidia-ctk runtime configure --runtime=crio`. Remove it and use CDI, or add `monitor_path` (Appendix CRI-O-3). |
+| crio won't start after editing `crio.conf.d` | A drop-in references a runtime with no definition, or an unknown key like `enable_criu_support`. Check `journalctl -xeu crio | tail`; use the minimal runc drop-in (Appendix CRI-O-2). |

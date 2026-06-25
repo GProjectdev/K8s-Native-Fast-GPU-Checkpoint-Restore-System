@@ -425,6 +425,93 @@ CRIU 없이 reconcile 루프, CR 상태 갱신, 스토리지 레이아웃을 검
 
 ---
 
+# 부록 — CRI-O 클러스터 (예: GProjectdev installer)
+
+위 Part A–C는 **containerd** 기준입니다. 클러스터가 **CRI-O**(소켓
+`/var/run/crio/crio.sock`,
+[Kubernetes_Installer_with_CRIO](https://github.com/GProjectdev/Kubernetes_Installer_with_CRIO)
+구성)라면 아래 차이를 적용하세요.
+
+### CRI-O-1. 에이전트를 CRI-O 소켓에 맞추기
+
+`deploy/daemonset.yaml`의 **소켓 3곳**과 env를 CRI-O로 바꾼 뒤 재적용:
+
+```bash
+sed -i 's#/run/containerd/containerd.sock#/var/run/crio/crio.sock#g' deploy/daemonset.yaml
+kubectl apply -f deploy/daemonset.yaml
+kubectl -n gpu-cr-system set env ds/gpu-cr-node-agent \
+  CONTAINER_RUNTIME_ENDPOINT=unix:///var/run/crio/crio.sock
+```
+
+> 안 하면 에이전트 Pod가
+> `hostPath type check failed: /run/containerd/containerd.sock is not a socket file`
+> 로 막힙니다.
+
+### CRI-O-2. CRIU + runc 런타임 (체크포인트 지원)
+
+CRI-O는 CRIU만 있으면 체크포인트/복원을 자동 활성화합니다 — `enable_criu_support`는
+**필요 없습니다**(최신 CRI-O에서 유효하지 않은 키라 crio가 시작에 실패함). CRIU + runc를
+설치하고 `runc` 런타임을 정의하세요:
+
+```bash
+sudo add-apt-repository -y ppa:criu/ppa && sudo apt-get update
+sudo apt-get install -y criu runc
+sudo criu check                         # "Looks good."
+which runc                              # 보통 /usr/sbin/runc
+
+sudo tee /etc/crio/crio.conf.d/99-runc.conf >/dev/null <<'EOF'
+[crio.runtime]
+default_runtime = "runc"
+
+[crio.runtime.runtimes.runc]
+runtime_path = "/usr/sbin/runc"
+runtime_type = "oci"
+runtime_root = "/run/runc"
+EOF
+sudo systemctl restart crio
+sudo systemctl status crio --no-pager   # active (running)
+```
+
+### CRI-O-3. CRI-O에서 NVIDIA GPU — 커스텀 런타임 대신 CDI
+
+`nvidia-ctk runtime configure --runtime=crio`는 `nvidia` 런타임 드롭인을 만드는데,
+CRI-O 1.33에서 **crio를 죽입니다**(`failed to translate monitor fields for runtime
+nvidia: "conmon" not found in $PATH`). **CDI**를 권장:
+
+```bash
+# 위 명령으로 만든 깨진 nvidia 런타임 드롭인 제거
+sudo rm -f /etc/crio/crio.conf.d/99-nvidia.toml
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+nvidia-ctk cdi list
+sudo systemctl restart crio
+```
+
+> 커스텀 런타임을 굳이 유지하려면 제거 대신 `[crio.runtime.runtimes.nvidia]` 블록에
+> `monitor_path = "/usr/libexec/crio/conmon"`를 추가하세요.
+
+### CRI-O-4. 노드 스토리지 / DiskPressure
+
+클라우드 이미지는 작은(~10GB) 루트 디스크로 부팅되고 큰 데이터 디스크는 **마운트되지
+않은 채** 방치되는 경우가 많습니다. 그러면 CRI-O 이미지 스토리지(`/var/lib/containers`)가
+루트를 가득 채워 kubelet이 `DiskPressure`로 Pod를 쫓아냅니다. 데이터 디스크를 컨테이너
+스토리지로 마운트하세요:
+
+```bash
+lsblk ; df -h /                          # 큰 디스크(예: /dev/sdb)가 미마운트인가?
+sudo systemctl stop kubelet crio
+sudo umount -R /var/lib/containers/storage/overlay 2>/dev/null || true
+sudo mkfs.ext4 -F /dev/sdb               # 디스크가 비었을 때만 (blkid 출력 없음)
+sudo mv /var/lib/containers /var/lib/containers.bak
+sudo mkdir -p /var/lib/containers
+echo '/dev/sdb /var/lib/containers ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
+sudo mount /var/lib/containers
+sudo systemctl start crio kubelet
+sudo rm -rf /var/lib/containers.bak      # 루트 공간 회수 (이게 DiskPressure를 푸는 핵심)
+df -h / /var/lib/containers
+```
+
+---
+
 # 트러블슈팅
 
 | 증상 | 원인 / 해결 |
@@ -437,3 +524,7 @@ CRIU 없이 reconcile 루프, CR 상태 갱신, 스토리지 레이아웃을 검
 | `unrecognized command-line option '-ftrivial-auto-var-init=zero'` | 기본 `gcc`가 커널 빌드 GCC보다 낮음. 드라이버 빌드 전에 `gcc-12` 설치/선택 (C-1). |
 | `cuda-checkpoint: command not found` | 바이너리가 PATH에 없음; github.com/NVIDIA/cuda-checkpoint의 prebuilt 바이너리 설치 (C-1b). 드라이버 정상 필요. |
 | GPU 측 체크포인트 안 됨 | GCR hook `libcuda.so`가 `/var/lib/gpu-cr/lib/`에 없음 (C-5). |
+| 에이전트 Pod: `hostPath type check failed: ...containerd.sock is not a socket` | 노드가 CRI-O인데 containerd 소켓을 마운트함. daemonset 소켓 + `CONTAINER_RUNTIME_ENDPOINT`를 `/var/run/crio/crio.sock`로 (부록 CRI-O-1). |
+| 에이전트 Pod `Evicted: node had condition [DiskPressure]` | 컨테이너 스토리지가 작은 루트 디스크에 있음. 데이터 디스크를 `/var/lib/containers`로 마운트하고 `.bak` 제거 (부록 CRI-O-4). |
+| crio 시작 실패: `failed to translate monitor fields for runtime nvidia: "conmon" not found` | `nvidia-ctk runtime configure --runtime=crio`가 만든 깨진 nvidia 런타임 드롭인. 제거 후 CDI 사용 또는 `monitor_path` 추가 (부록 CRI-O-3). |
+| `crio.conf.d` 수정 후 crio 시작 실패 | 드롭인이 정의 없는 런타임을 참조하거나 `enable_criu_support` 같은 모르는 키 사용. `journalctl -xeu crio | tail` 확인, 최소 runc 드롭인 사용 (부록 CRI-O-2). |

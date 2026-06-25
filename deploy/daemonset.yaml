@@ -44,6 +44,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # CRI endpoint used by crictl for container PID resolution.
+            #   containerd (default): unix:///run/containerd/containerd.sock
+            #   CRI-O:                unix:///var/run/crio/crio.sock
+            # Must match the `cri-sock` volume path below.
+            - name: CONTAINER_RUNTIME_ENDPOINT
+              value: unix:///run/containerd/containerd.sock
+            # Path to the host cuda-checkpoint binary (mounted via host-usr-bin).
+            - name: CUDA_CHECKPOINT_BIN
+              value: /host/usr/bin/cuda-checkpoint
           securityContext:
             privileged: true
           volumeMounts:
@@ -57,7 +66,13 @@ spec:
             # kubelet checkpoint archives.
             - name: kubelet-checkpoints
               mountPath: /var/lib/kubelet/checkpoints
+            # Checkpoint output dir — MUST match .spec.storage.path in your
+            # GPUCheckpoint CRs so the archive persists on the node / shared FS.
+            - name: gcr-checkpoint
+              mountPath: /var/lib/gcr-checkpoint
             # CRI socket for crictl PID resolution.
+            #   containerd: /run/containerd/containerd.sock
+            #   CRI-O:      /var/run/crio/crio.sock  (change all 3 socket refs together)
             - name: cri-sock
               mountPath: /run/containerd/containerd.sock
           ports:
@@ -86,7 +101,12 @@ spec:
           hostPath:
             path: /var/lib/kubelet/checkpoints
             type: DirectoryOrCreate
+        - name: gcr-checkpoint
+          hostPath:
+            path: /var/lib/gcr-checkpoint
+            type: DirectoryOrCreate
         - name: cri-sock
           hostPath:
+            # containerd default; for CRI-O use /var/run/crio/crio.sock
             path: /run/containerd/containerd.sock
             type: Socket

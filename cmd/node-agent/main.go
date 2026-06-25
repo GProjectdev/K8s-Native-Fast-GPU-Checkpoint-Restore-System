@@ -91,6 +91,14 @@ func main() {
 	}
 
 	cp := agent.NewCheckpointer(im, kc, dryRun)
+	// Allow pointing at host-mounted binaries / a specific CRI runtime.
+	// crictl itself also reads CONTAINER_RUNTIME_ENDPOINT from the env.
+	if v := os.Getenv("CUDA_CHECKPOINT_BIN"); v != "" {
+		cp.CudaCheckpointBin = v
+	}
+	if v := os.Getenv("CRICTL_BIN"); v != "" {
+		cp.CrictlBin = v
+	}
 	r := &agent.Reconciler{
 		Client:       mgr.GetClient(),
 		NodeName:     nodeName,
