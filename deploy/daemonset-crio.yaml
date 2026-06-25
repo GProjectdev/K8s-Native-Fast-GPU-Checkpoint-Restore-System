@@ -33,8 +33,11 @@ spec:
           effect: NoSchedule
       containers:
         - name: node-agent
-          image: docker.io/<your-dockerhub-user>/gpu-cr-node-agent:v1.2
-          imagePullPolicy: IfNotPresent
+          # NOTE: while iterating you may keep ONE tag (e.g. :v1.0) and rebuild it.
+          # With a reused tag you MUST use imagePullPolicy: Always, otherwise the
+          # node keeps the cached old image and your new code never runs.
+          image: docker.io/jeongseungjun/gpu-cr-node-agent:v1.0
+          imagePullPolicy: Always
           args:
             - --kubelet-url=https://127.0.0.1:10250
             - --kubelet-insecure=true

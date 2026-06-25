@@ -1,0 +1,15 @@
+# Checkpoint request for the PyTorch (driver-550-compatible) sample Pod.
+apiVersion: gpu-cr.io/v1alpha1
+kind: GPUCheckpoint
+metadata:
+  name: ckpt-cuda-001
+  namespace: default
+spec:
+  podRef:
+    namespace: default
+    name: cuda-gcr-pod
+    container: cuda-app
+  storage:
+    type: hostPath
+    path: /var/lib/gcr-checkpoint
+  period: "000000"        # one-shot; use "000500" etc. for periodic
