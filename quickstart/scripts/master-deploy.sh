@@ -20,12 +20,16 @@ cd "$REPO_ROOT"
 log "1/4  NVIDIA device plugin (advertises nvidia.com/gpu)"
 kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.16.2/deployments/static/nvidia-device-plugin.yml
 
-log "2/4  label GPU nodes (edit the node list if needed)"
-for n in $(kubectl get nodes -o name | grep -v control-plane | sed 's#node/##'); do
-  if kubectl describe node "$n" | grep -q 'nvidia.com/gpu'; then
-    kubectl label node "$n" nvidia.com/gpu.present=true --overwrite
-    echo "  labelled $n"
-  fi
+log "2/4  label GPU nodes"
+# Label every non-control-plane node as a GPU node. The node-agent DaemonSet uses
+# nodeSelector nvidia.com/gpu.present=true, so this MUST happen for it to schedule.
+# NOTE: do NOT gate this on nvidia.com/gpu being advertised — that resource only
+# appears AFTER the device plugin is Running, which would deadlock a fresh cluster.
+# If some workers are CPU-only, set GPU_NODES="node-a node-b" before running.
+GPU_NODES="${GPU_NODES:-$(kubectl get nodes -o name | grep -v control-plane | sed 's#node/##')}"
+for n in $GPU_NODES; do
+  kubectl label node "$n" nvidia.com/gpu.present=true --overwrite
+  echo "  labelled $n"
 done
 
 log "3/4  CRD + RBAC + namespace"
