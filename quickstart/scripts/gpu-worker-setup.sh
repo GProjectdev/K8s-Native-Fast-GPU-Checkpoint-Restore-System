@@ -139,10 +139,15 @@ CONF
 # does NOT include crun -> every container fails ("container does not exist"),
 # which breaks Cilium on the node, which taints it node.cilium.io/agent-not-ready
 # and blocks all DaemonSets. Make nvidia-container-runtime delegate to crun.
-if command -v nvidia-ctk >/dev/null 2>&1; then
-  nvidia-ctk config --in-place --set nvidia-container-runtime.runtimes='["crun","runc"]' 2>/dev/null     || sed -i 's/^\([[:space:]]*runtimes = \).*/\1["crun", "runc"]/' /etc/nvidia-container-runtime/config.toml 2>/dev/null || true
+# Ensure the crun binary CRI-O uses is resolvable by nvidia-container-runtime,
+# then write a PROPER TOML list. Do NOT use `nvidia-ctk config --set` here: it
+# stores the value as a single string -> candidate "[[\"crun\"]]" -> not found.
+CRUN="$(command -v crun || ls /usr/libexec/crio/crun /usr/sbin/crun 2>/dev/null | head -1)"
+[ -n "$CRUN" ] && [ ! -e /usr/bin/crun ] && ln -sf "$CRUN" /usr/bin/crun
+if [ -f /etc/nvidia-container-runtime/config.toml ]; then
+  sed -i 's|^[[:space:]]*runtimes[[:space:]]*=.*|runtimes = ["crun", "runc"]|' /etc/nvidia-container-runtime/config.toml
 fi
-grep -n 'runtimes' /etc/nvidia-container-runtime/config.toml 2>/dev/null || true
+echo "  crun -> ${CRUN:-(none)}; $(grep -n runtimes /etc/nvidia-container-runtime/config.toml 2>/dev/null)"
 systemctl daemon-reload
 systemctl restart crio
 sleep 2
