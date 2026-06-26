@@ -56,6 +56,10 @@ spec:
               value: unix:///run/crio/crio.sock
             - name: CUDA_CHECKPOINT_BIN
               value: /host/usr/bin/cuda-checkpoint
+            # cuda-checkpoint dynamically links libcuda.so.1 (the host NVIDIA
+            # driver lib), absent from the agent image; expose it via LD_LIBRARY_PATH.
+            - name: LD_LIBRARY_PATH
+              value: /host/usr/lib/x86_64-linux-gnu
           securityContext:
             privileged: true
           volumeMounts:
@@ -63,6 +67,10 @@ spec:
               mountPath: /host/gpu-cr
             - name: host-usr-bin
               mountPath: /host/usr/bin
+              readOnly: true
+            # Host NVIDIA driver libraries (libcuda.so.1) for cuda-checkpoint.
+            - name: host-usr-lib
+              mountPath: /host/usr/lib/x86_64-linux-gnu
               readOnly: true
             - name: kubelet-checkpoints
               mountPath: /var/lib/kubelet/checkpoints
@@ -91,6 +99,10 @@ spec:
         - name: host-usr-bin
           hostPath:
             path: /usr/bin
+            type: Directory
+        - name: host-usr-lib
+          hostPath:
+            path: /usr/lib/x86_64-linux-gnu
             type: Directory
         - name: kubelet-checkpoints
           hostPath:

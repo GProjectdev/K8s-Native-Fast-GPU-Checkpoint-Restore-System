@@ -53,6 +53,10 @@ spec:
             # Path to the host cuda-checkpoint binary (mounted via host-usr-bin).
             - name: CUDA_CHECKPOINT_BIN
               value: /host/usr/bin/cuda-checkpoint
+            # cuda-checkpoint dynamically links libcuda.so.1 (the host NVIDIA
+            # driver lib), absent from the agent image; expose it via LD_LIBRARY_PATH.
+            - name: LD_LIBRARY_PATH
+              value: /host/usr/lib/x86_64-linux-gnu
           securityContext:
             privileged: true
           volumeMounts:
@@ -62,6 +66,10 @@ spec:
             # cuda-checkpoint binary + driver libs from the host.
             - name: host-usr-bin
               mountPath: /host/usr/bin
+              readOnly: true
+            # Host NVIDIA driver libraries (libcuda.so.1) for cuda-checkpoint.
+            - name: host-usr-lib
+              mountPath: /host/usr/lib/x86_64-linux-gnu
               readOnly: true
             # kubelet checkpoint archives.
             - name: kubelet-checkpoints
@@ -96,6 +104,10 @@ spec:
         - name: host-usr-bin
           hostPath:
             path: /usr/bin
+            type: Directory
+        - name: host-usr-lib
+          hostPath:
+            path: /usr/lib/x86_64-linux-gnu
             type: Directory
         - name: kubelet-checkpoints
           hostPath:
