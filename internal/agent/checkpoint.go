@@ -164,9 +164,15 @@ func (c *Checkpointer) cudaToggle(ctx context.Context, pid int) error {
 	name := c.CudaCheckpointBin
 	args := []string{"--toggle", "--pid", fmt.Sprintf("%d", pid)}
 	if c.Nsenter {
-		// nsenter -t 1 -a -- /usr/bin/cuda-checkpoint --toggle --pid <hostpid>
+		// Run cuda-checkpoint in the host namespaces with a CLEAN environment
+		// (like sudo): inheriting the agent's LD_LIBRARY_PATH etc. crashes it.
+		//   nsenter -t 1 -a -- /usr/bin/env -i PATH=... /usr/bin/cuda-checkpoint ...
 		name = "nsenter"
-		args = append([]string{"-t", "1", "-a", "--", c.CudaCheckpointHostBin}, args...)
+		pre := []string{"-t", "1", "-a", "--",
+			"/usr/bin/env", "-i",
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			c.CudaCheckpointHostBin}
+		args = append(pre, args...)
 	}
 	out, err := c.run(ctx, name, args...)
 	if err != nil {
