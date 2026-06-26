@@ -44,6 +44,13 @@ type Checkpointer struct {
 	// in-Pod GCR hook). Set false when the upstream GCR hook (libcuda.so) is not
 	// wired up; the pipeline then relies on cuda-checkpoint + CRIU only.
 	GCRInterception bool
+	// Nsenter runs cuda-checkpoint inside the host's namespaces (via `nsenter -t
+	// 1 -a`) so it executes exactly as on the host — correct driver libs, /dev,
+	// /proc, ld cache — avoiding container lib/namespace mismatches.
+	Nsenter bool
+	// CudaCheckpointHostBin is the cuda-checkpoint path as seen on the HOST
+	// (used when Nsenter is true).
+	CudaCheckpointHostBin string
 
 	run commandRunner
 }
@@ -60,10 +67,11 @@ func NewCheckpointer(im *InterceptorManager, kc *KubeletClient, dryRun bool) *Ch
 	return &Checkpointer{
 		Interceptor:       im,
 		Kubelet:           kc,
-		CudaCheckpointBin: "cuda-checkpoint",
-		CrictlBin:         "crictl",
-		DryRun:            dryRun,
-		GCRInterception:   true,
+		CudaCheckpointBin:     "cuda-checkpoint",
+		CudaCheckpointHostBin: "/usr/bin/cuda-checkpoint",
+		CrictlBin:             "crictl",
+		DryRun:                dryRun,
+		GCRInterception:       true,
 		run:               defaultRunner,
 	}
 }
@@ -153,9 +161,16 @@ func (c *Checkpointer) cudaToggle(ctx context.Context, pid int) error {
 	if c.DryRun || pid <= 0 {
 		return nil
 	}
-	out, err := c.run(ctx, c.CudaCheckpointBin, "--toggle", "--pid", fmt.Sprintf("%d", pid))
+	name := c.CudaCheckpointBin
+	args := []string{"--toggle", "--pid", fmt.Sprintf("%d", pid)}
+	if c.Nsenter {
+		// nsenter -t 1 -a -- /usr/bin/cuda-checkpoint --toggle --pid <hostpid>
+		name = "nsenter"
+		args = append([]string{"-t", "1", "-a", "--", c.CudaCheckpointHostBin}, args...)
+	}
+	out, err := c.run(ctx, name, args...)
 	if err != nil {
-		return fmt.Errorf("%s: %v (%s)", c.CudaCheckpointBin, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s: %v (%s)", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

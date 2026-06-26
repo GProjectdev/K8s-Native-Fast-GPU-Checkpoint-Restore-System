@@ -102,6 +102,12 @@ func main() {
 	if os.Getenv("GCR_INTERCEPTION") == "false" {
 		cp.GCRInterception = false
 	}
+	if os.Getenv("CUDA_CHECKPOINT_NSENTER") == "true" {
+		cp.Nsenter = true
+	}
+	if v := os.Getenv("CUDA_CHECKPOINT_HOST_BIN"); v != "" {
+		cp.CudaCheckpointHostBin = v
+	}
 	r := &agent.Reconciler{
 		Client:       mgr.GetClient(),
 		NodeName:     nodeName,

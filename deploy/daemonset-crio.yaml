@@ -60,6 +60,9 @@ spec:
             # driver lib), absent from the agent image; expose it via LD_LIBRARY_PATH.
             - name: LD_LIBRARY_PATH
               value: /host/usr/lib/x86_64-linux-gnu
+            # Run cuda-checkpoint in the host namespaces (most robust).
+            - name: CUDA_CHECKPOINT_NSENTER
+              value: "true"
           securityContext:
             privileged: true
           volumeMounts:

@@ -16,7 +16,7 @@ RUN make
 # ---- Runtime image ----
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl tar \
+ && apt-get install -y --no-install-recommends ca-certificates curl tar util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 # crictl for container PID resolution.
