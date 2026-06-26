@@ -9,7 +9,7 @@ Checkpoint/Restore system on Kubernetes (CRI-O).
 > the boot disk.
 
 ## 0. Prereqs (VM creation)
-- GCP A100 instance (e.g. `a2-highgpu-1g`), Ubuntu 22.04 LTS
+- GCP A100 instance (e.g. `a2-highgpu-1g`), Ubuntu 22.04 LTS  *(paper: A100-40GB ×2, NVLink, PCIe 4.0, CUDA 12.6)*
 - **300GB boot disk**, **no** additional disks
 - 1 master + N GPU workers; firewall allows node-to-node + apiserver 6443
 
@@ -29,7 +29,7 @@ sudo bash quickstart/scripts/gpu-worker-setup.sh   # installs driver, asks to re
 sudo reboot
 sudo bash quickstart/scripts/gpu-worker-setup.sh   # finishes everything
 ```
-It sets up: gcc-12 + headers, NVIDIA driver 550, cuda-checkpoint binary, NVIDIA
+It sets up: gcc-12 + headers, NVIDIA driver 560 (CUDA 12.6, paper setup), cuda-checkpoint binary, NVIDIA
 Container Toolkit, CRIU+runc (+CRIU CUDA-plugin probe), CRI-O drop-in (nvidia
 default + monitor_path), kubelet `ContainerCheckpoint` gate, and the GPU C/R dirs.
 
@@ -42,13 +42,16 @@ Installs NVIDIA device plugin → labels GPU nodes → applies CRD + RBAC +
 `docker.io/jeongseungjun/gpu-cr-node-agent:v1.0`, `imagePullPolicy: Always`).
 
 ## 4. Test — deploy a GPU pod, then request a checkpoint
+Paper-matched workload (vLLM 0.9.1, driver 560 / CUDA 12.6):
 ```bash
-kubectl apply -f deploy/sample-pod-pytorch.yaml
-kubectl get pod cuda-gcr-pod -o wide -w
-kubectl apply -f deploy/sample-gpucheckpoint-pytorch.yaml
+kubectl apply -f deploy/sample-pod-vllm.yaml
+kubectl get pod vllm-gcr-pod -o wide -w
+kubectl apply -f deploy/sample-gpucheckpoint-vllm.yaml
 kubectl get gpucheckpoints -w
 kubectl -n gpu-cr-system logs -l app.kubernetes.io/name=gpu-cr-node-agent -f
 ```
+(No 560 driver? Use the PyTorch fallback: `deploy/sample-pod-pytorch.yaml` +
+`deploy/sample-gpucheckpoint-pytorch.yaml`, which works on driver 550.)
 5-step pipeline (`internal/agent/checkpoint.go`): (1) selective-interception data
 buffer checkpoint → (2) cuda-checkpoint control-state suspend → (3) kubelet
 checkpoint API (CRI-O/CRIU) → (4) store to `.spec.storage.path` → (5) resume.

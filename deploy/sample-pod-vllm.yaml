@@ -1,0 +1,68 @@
+# Paper-matched GPU workload: vLLM 0.9.1 (GCR paper §6 Setups) on driver 560 /
+# CUDA 12.6. Serves a small representative LLM (OPT-125M) so it loads fast and
+# fits one GPU, while holding real GPU data buffers for checkpointing.
+# Requires the worker to run NVIDIA driver >= 560 (run gpu-worker-setup.sh).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-gcr-pod
+  namespace: default
+  labels:
+    app: vllm-gcr
+spec:
+  containers:
+    - name: cuda-app
+      image: vllm/vllm-openai:v0.9.1          # paper: vLLM 0.9.1, CUDA 12.6
+      args:
+        - "--model=facebook/opt-125m"          # representative, ungated; swap for Llama/Qwen
+        - "--max-model-len=2048"
+        - "--gpu-memory-utilization=0.6"
+      env:
+        # Selective CUDA interceptor (loaded before the CUDA runtime).
+        - name: LD_PRELOAD
+          value: /opt/gpu-cr/libgcr-interceptor.so
+        - name: GCR_HOME
+          value: /opt/gpu-cr
+        - name: GCR_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: GCR_CONTROL_DIR
+          value: /var/lib/gpu-cr/run
+        - name: GCR_DATA_DIR
+          value: /var/lib/gcr-checkpoint
+        # HF cache on the GPU dir (avoids re-download across restarts).
+        - name: HF_HOME
+          value: /var/lib/gcr-checkpoint/hf-cache
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      ports:
+        - containerPort: 8000
+      volumeMounts:
+        - name: gpu-cr-lib
+          mountPath: /opt/gpu-cr
+          readOnly: true
+        - name: gpu-cr-run
+          mountPath: /var/lib/gpu-cr/run
+        - name: gcr-checkpoint
+          mountPath: /var/lib/gcr-checkpoint
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: gpu-cr-lib
+      hostPath:
+        path: /var/lib/gpu-cr/lib
+        type: Directory
+    - name: gpu-cr-run
+      hostPath:
+        path: /var/lib/gpu-cr/run
+        type: DirectoryOrCreate
+    - name: gcr-checkpoint
+      hostPath:
+        path: /var/lib/gcr-checkpoint
+        type: DirectoryOrCreate
+    - name: shm                                 # vLLM needs a larger /dev/shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 2Gi

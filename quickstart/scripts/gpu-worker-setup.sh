@@ -42,11 +42,11 @@ update-alternatives --set gcc /usr/bin/gcc-12
 log "gcc -> $(gcc -dumpversion)"
 
 # -----------------------------------------------------------------------------
-# 2) NVIDIA driver 550 (provides cuda-checkpoint support; CUDA 12.4 runtime ABI)
+# 2) NVIDIA driver 560 (CUDA 12.6 — matches the GCR paper setup; cuda-checkpoint needs >=550)
 #    If the driver is not yet usable, install it and STOP for a reboot.
 # -----------------------------------------------------------------------------
 if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
-  log "2/8  installing NVIDIA driver 550 (reboot required afterwards)"
+  log "2/8  installing NVIDIA driver 560 / CUDA 12.6 (reboot required afterwards)"
   if [ ! -f /usr/share/keyrings/cuda-archive-keyring.gpg ] && \
      ! dpkg -l | grep -q cuda-keyring; then
     wget -qO /tmp/cuda-keyring.deb \
@@ -54,7 +54,7 @@ if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
     dpkg -i /tmp/cuda-keyring.deb
     apt-get update -y
   fi
-  apt-get install -y nvidia-driver-550 || apt-get install -y cuda-drivers-550
+  apt-get install -y cuda-drivers-560 || apt-get install -y nvidia-driver-560
   warn "=============================================================="
   warn " NVIDIA driver installed. REBOOT now, then RE-RUN this script:"
   warn "   sudo reboot"
