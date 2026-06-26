@@ -51,6 +51,11 @@ type Checkpointer struct {
 	// CudaCheckpointHostBin is the cuda-checkpoint path as seen on the HOST
 	// (used when Nsenter is true).
 	CudaCheckpointHostBin string
+	// SkipCudaCheckpoint skips the agent's manual cuda-checkpoint step entirely
+	// and lets CRI-O + CRIU (with the NVIDIA CUDA plugin) checkpoint the GPU as
+	// part of the container checkpoint (the CRIUgpu approach). Use this when the
+	// agent cannot run cuda-checkpoint cross-namespace.
+	SkipCudaCheckpoint bool
 
 	run commandRunner
 }
@@ -119,7 +124,11 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 	if err := c.cudaToggle(ctx, t.HostPID); err != nil {
 		return nil, fmt.Errorf("cuda-checkpoint suspend: %w", err)
 	}
-	klog.V(2).Info("step 2/5 done: control state suspended (cuda-checkpoint)")
+	if c.SkipCudaCheckpoint {
+		klog.V(2).Info("step 2/5 skipped: cuda-checkpoint delegated to CRI-O/CRIU (CRIUgpu)")
+	} else {
+		klog.V(2).Info("step 2/5 done: control state suspended (cuda-checkpoint)")
+	}
 
 	// (3) Container checkpoint through the kubelet API (CRIU).
 	var produced []string
@@ -158,7 +167,7 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 
 // cudaToggle flips the CUDA state (running <-> suspended) for the process.
 func (c *Checkpointer) cudaToggle(ctx context.Context, pid int) error {
-	if c.DryRun || pid <= 0 {
+	if c.DryRun || pid <= 0 || c.SkipCudaCheckpoint {
 		return nil
 	}
 	name := c.CudaCheckpointBin

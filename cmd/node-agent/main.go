@@ -108,6 +108,9 @@ func main() {
 	if v := os.Getenv("CUDA_CHECKPOINT_HOST_BIN"); v != "" {
 		cp.CudaCheckpointHostBin = v
 	}
+	if os.Getenv("CUDA_CHECKPOINT_SKIP") == "true" {
+		cp.SkipCudaCheckpoint = true
+	}
 	r := &agent.Reconciler{
 		Client:       mgr.GetClient(),
 		NodeName:     nodeName,
