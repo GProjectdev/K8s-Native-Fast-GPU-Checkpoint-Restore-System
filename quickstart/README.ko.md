@@ -181,5 +181,7 @@ kubectl -n gpu-cr-system rollout restart ds/gpu-cr-node-agent
 | `libcuda.so.1 not found` (에이전트) | 호스트 `/usr/lib/x86_64-linux-gnu` 마운트 + `LD_LIBRARY_PATH` (daemonset-crio.yaml에 반영됨) |
 | checkpoint API 404/disabled | kubelet `ContainerCheckpoint` 게이트 (7단계) |
 | `kubectl get nodes` NotReady | Installer의 CNI 적용 확인 |
+| DaemonSet DESIRED=0 (device plugin/node-agent Pod 안 뜸) | 워커에서 nvidia-container-runtime가 crun 미위임 → 컨테이너 실패 → Cilium not ready → `node.cilium.io/agent-not-ready` 테인트. `nvidia-ctk config --in-place --set nvidia-container-runtime.runtimes='["crun","runc"]'` 후 `systemctl restart crio kubelet` |
+| 워커 `cri-o://Unknown` / Cilium 1개만 Ready | 위와 동일 원인(crun 위임 누락). 수정 후 워커 Cilium Ready·테인트 해제 확인 |
 
 자세한 검증 로그/배경은 `docs/SETUP.ko.md` 참고.

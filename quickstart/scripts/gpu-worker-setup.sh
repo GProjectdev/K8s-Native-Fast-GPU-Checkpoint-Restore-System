@@ -134,6 +134,15 @@ runtime_type = "oci"
 runtime_root = "/run/runc"
 monitor_path = "${CONMON}"
 CONF
+# CRITICAL: this CRI-O uses crun as its low-level runtime (/run/crun), but
+# nvidia-container-runtime's default delegate list is ["docker-runc","runc"] and
+# does NOT include crun -> every container fails ("container does not exist"),
+# which breaks Cilium on the node, which taints it node.cilium.io/agent-not-ready
+# and blocks all DaemonSets. Make nvidia-container-runtime delegate to crun.
+if command -v nvidia-ctk >/dev/null 2>&1; then
+  nvidia-ctk config --in-place --set nvidia-container-runtime.runtimes='["crun","runc"]' 2>/dev/null     || sed -i 's/^\([[:space:]]*runtimes = \).*/\1["crun", "runc"]/' /etc/nvidia-container-runtime/config.toml 2>/dev/null || true
+fi
+grep -n 'runtimes' /etc/nvidia-container-runtime/config.toml 2>/dev/null || true
 systemctl daemon-reload
 systemctl restart crio
 sleep 2
