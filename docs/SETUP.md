@@ -153,6 +153,19 @@ sudo systemctl start crio kubelet
 df -h / /var/lib/containers /var/tmp     # containers + tmp now ~big disk
 ```
 
+> **Also relocate the checkpoint OUTPUT dirs to the big disk** — the interceptor
+> writes the GPU data-buffer copy to `/var/lib/gcr-checkpoint` and CRIU writes the
+> container tar to `/var/lib/kubelet/checkpoints`; both default to the small root
+> and will refill it (DiskPressure) on large workloads:
+>
+> ```bash
+> sudo mkdir -p /var/lib/containers/gcr-checkpoint /var/lib/containers/kubelet-checkpoints
+> sudo mkdir -p /var/lib/gcr-checkpoint /var/lib/kubelet/checkpoints
+> echo '/var/lib/containers/gcr-checkpoint /var/lib/gcr-checkpoint none bind 0 0' | sudo tee -a /etc/fstab
+> echo '/var/lib/containers/kubelet-checkpoints /var/lib/kubelet/checkpoints none bind 0 0' | sudo tee -a /etc/fstab
+> sudo mount /var/lib/gcr-checkpoint ; sudo mount /var/lib/kubelet/checkpoints
+> ```
+
 ### 2.5 GPU C/R runtime directories
 
 ```bash

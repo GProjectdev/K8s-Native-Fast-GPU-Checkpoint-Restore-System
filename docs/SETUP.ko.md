@@ -152,6 +152,19 @@ sudo systemctl start crio kubelet
 df -h / /var/lib/containers /var/tmp
 ```
 
+> **체크포인트 출력 디렉토리도 큰 디스크로 옮기세요** — 인터셉터는 GPU 데이터버퍼
+> 복사본을 `/var/lib/gcr-checkpoint`에, CRIU는 컨테이너 tar를
+> `/var/lib/kubelet/checkpoints`에 씁니다. 둘 다 기본은 작은 루트라 큰 워크로드에서
+> 루트를 다시 채워 DiskPressure를 일으킵니다:
+>
+> ```bash
+> sudo mkdir -p /var/lib/containers/gcr-checkpoint /var/lib/containers/kubelet-checkpoints
+> sudo mkdir -p /var/lib/gcr-checkpoint /var/lib/kubelet/checkpoints
+> echo '/var/lib/containers/gcr-checkpoint /var/lib/gcr-checkpoint none bind 0 0' | sudo tee -a /etc/fstab
+> echo '/var/lib/containers/kubelet-checkpoints /var/lib/kubelet/checkpoints none bind 0 0' | sudo tee -a /etc/fstab
+> sudo mount /var/lib/gcr-checkpoint ; sudo mount /var/lib/kubelet/checkpoints
+> ```
+
 ### 2.5 GPU C/R 런타임 디렉토리
 
 ```bash
