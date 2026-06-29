@@ -1,0 +1,70 @@
+# Level 1 test pod: PyTorch with VMM allocator (expandable_segments) + interceptor.
+# Step 1 goal: confirm the interceptor's VMM hooks fire (cuMemCreate/cuMemMap) and
+# that we capture the GPU segments. The checksum loop is for later steps (verify
+# data integrity after copy/unmap/remap).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cuda-l1-pod
+  namespace: default
+  labels:
+    app: cuda-l1
+spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  containers:
+    - name: cuda-app
+      image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+      command: ["python", "-c"]
+      args:
+        - |
+          import torch, time
+          torch.manual_seed(0)
+          x = torch.randn(2048, 2048, 256, device='cuda')   # ~4GB via VMM segments
+          base = float(x.sum().item())
+          print("GPU tensor allocated; checksum=%.6f" % base, flush=True)
+          while True:
+              cur = float(x.sum().item())
+              print("checksum=%.6f %s" % (cur, "OK" if abs(cur-base) < 1.0 else "MISMATCH!"), flush=True)
+              time.sleep(15)
+      env:
+        # Make PyTorch use the CUDA VMM API (cuMemCreate/cuMemMap) so the
+        # interceptor can do GCR-style copy + physical free + remap.
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: expandable_segments:True
+        - name: LD_PRELOAD
+          value: /opt/gpu-cr/libgcr-interceptor.so
+        - name: GCR_HOME
+          value: /opt/gpu-cr
+        - name: GCR_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: GCR_CONTROL_DIR
+          value: /var/lib/gpu-cr/run
+        - name: GCR_DATA_DIR
+          value: /var/lib/gcr-checkpoint
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: gpu-cr-lib
+          mountPath: /opt/gpu-cr
+          readOnly: true
+        - name: gpu-cr-run
+          mountPath: /var/lib/gpu-cr/run
+        - name: gcr-checkpoint
+          mountPath: /var/lib/gcr-checkpoint
+  volumes:
+    - name: gpu-cr-lib
+      hostPath:
+        path: /var/lib/gpu-cr/lib
+        type: Directory
+    - name: gpu-cr-run
+      hostPath:
+        path: /var/lib/gpu-cr/run
+        type: DirectoryOrCreate
+    - name: gcr-checkpoint
+      hostPath:
+        path: /var/lib/gcr-checkpoint
+        type: DirectoryOrCreate

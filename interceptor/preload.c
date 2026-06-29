@@ -1,15 +1,17 @@
 // libgcr-interceptor.so — selective CUDA-interception shim (LD_PRELOAD).
 //
-// Realizes the GCR *idea* with our own code (no upstream GCR hook):
-//   1. Interposes CUDA memory APIs (cudaMalloc/cudaFree, cuMemAlloc/Free) to keep
-//      a live registry of GPU buffers — the "selective interception".
-//   2. On the Node Agent's checkpoint signal, performs the SELECTIVE DATA-BUFFER
-//      CHECKPOINT: actually copies each tracked GPU buffer Device->Host (chunked
-//      cudaMemcpy) into the checkpoint storage, writes the intercepted-info, and
-//      ACKs. Best-effort: if the in-process copy fails it logs and still ACKs, so
-//      the agent proceeds (cuda-checkpoint + CRIU then handle the rest).
+// Realizes the GCR *idea* with our own code (no upstream GCR hook).
 //
-// No CUDA headers needed — we match the stable CUDA ABI directly.
+// LEVEL 1, STEP 1 (this file): add CUDA Virtual Memory Management (VMM) hooks and
+// a segment registry. PyTorch with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+// allocates GPU memory via the VMM driver API (cuMemCreate / cuMemMap / ...), which
+// is exactly the API GCR needs to copy data to host AND free physical memory while
+// PRESERVING the virtual address. In this step we ONLY OBSERVE: track the segments
+// and, on a checkpoint signal, log what we captured. No device memory is copied,
+// unmapped, or freed yet (that is step 2/3/4).
+//
+// We also keep the legacy cudaMalloc/cuMemAlloc_v2 hooks so non-VMM allocations
+// remain visible. No CUDA headers needed — we match the stable CUDA ABI directly.
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -25,9 +27,28 @@
 #define GCR_IDLE 0
 #define GCR_CKPT 1
 #define GCR_RESTORE 2
-#define CUDA_MEMCPY_D2H 2
-#define CHUNK (64UL << 20) // 64MB host staging chunk
 
+// ---- CUDA VMM ABI (declared locally; no CUDA headers) -------------------
+typedef int                CUresult_t;     // CUresult enum -> int
+typedef unsigned long long CUdeviceptr_t;  // 64-bit device pointer
+typedef unsigned long long CUmemHandle_t;  // CUmemGenericAllocationHandle
+
+// CUmemAllocationProp ABI (32 bytes on x86-64). Stored so step 4 (restore) can
+// recreate physical memory with identical properties.
+typedef struct {
+    int   type;                  // CUmemAllocationType
+    int   requestedHandleTypes;  // CUmemAllocationHandleType
+    struct { int type; int id; } location;  // CUmemLocation
+    void *win32HandleMetaData;
+    struct {
+        unsigned char  compressionType;
+        unsigned char  gpuDirectRDMACapable;
+        unsigned short usage;
+        unsigned char  reserved[4];
+    } allocFlags;
+} gcr_mem_prop_t;
+
+// ---- legacy (cudaMalloc / cuMemAlloc_v2) registry -----------------------
 typedef struct { void *ptr; size_t size; int live; } gcr_alloc_t;
 #define GCR_MAX_ALLOCS 65536
 static gcr_alloc_t g_allocs[GCR_MAX_ALLOCS];
@@ -49,6 +70,66 @@ static void reg_del(void *ptr) {
     pthread_mutex_unlock(&g_lock);
 }
 
+// ---- VMM registry: physical handles + mapped segments -------------------
+typedef struct { CUmemHandle_t handle; size_t size; gcr_mem_prop_t prop; int live; } gcr_phys_t;
+typedef struct { CUdeviceptr_t va; size_t size; size_t offset; CUmemHandle_t handle; int live; } gcr_seg_t;
+#define GCR_MAX_VMM 131072
+static gcr_phys_t g_phys[GCR_MAX_VMM]; static atomic_size_t g_phys_n = 0;
+static gcr_seg_t  g_seg[GCR_MAX_VMM];  static atomic_size_t g_seg_n  = 0;
+static pthread_mutex_t g_vmm_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void vmm_phys_add(CUmemHandle_t h, size_t size, const void *prop) {
+    pthread_mutex_lock(&g_vmm_lock);
+    size_t n = atomic_load(&g_phys_n);
+    if (n < GCR_MAX_VMM) {
+        g_phys[n].handle = h; g_phys[n].size = size; g_phys[n].live = 1;
+        if (prop) memcpy(&g_phys[n].prop, prop, sizeof(gcr_mem_prop_t));
+        atomic_store(&g_phys_n, n + 1);
+    }
+    pthread_mutex_unlock(&g_vmm_lock);
+    fprintf(stderr, "[gcr][vmm] cuMemCreate handle=%llu size=%zu\n", (unsigned long long)h, size);
+    fflush(stderr);
+}
+static void vmm_seg_add(CUdeviceptr_t va, size_t size, size_t off, CUmemHandle_t h) {
+    pthread_mutex_lock(&g_vmm_lock);
+    size_t n = atomic_load(&g_seg_n);
+    if (n < GCR_MAX_VMM) { g_seg[n].va = va; g_seg[n].size = size; g_seg[n].offset = off; g_seg[n].handle = h; g_seg[n].live = 1; atomic_store(&g_seg_n, n + 1); }
+    pthread_mutex_unlock(&g_vmm_lock);
+    fprintf(stderr, "[gcr][vmm] cuMemMap va=0x%llx size=%zu handle=%llu\n", (unsigned long long)va, size, (unsigned long long)h);
+    fflush(stderr);
+}
+static void vmm_seg_del(CUdeviceptr_t va) {
+    pthread_mutex_lock(&g_vmm_lock);
+    size_t n = atomic_load(&g_seg_n);
+    for (size_t i = 0; i < n; i++) if (g_seg[i].live && g_seg[i].va == va) { g_seg[i].live = 0; break; }
+    pthread_mutex_unlock(&g_vmm_lock);
+}
+static void vmm_phys_del(CUmemHandle_t h) {
+    pthread_mutex_lock(&g_vmm_lock);
+    size_t n = atomic_load(&g_phys_n);
+    for (size_t i = 0; i < n; i++) if (g_phys[i].live && g_phys[i].handle == h) { g_phys[i].live = 0; break; }
+    pthread_mutex_unlock(&g_vmm_lock);
+}
+
+// STEP 1: observe only — log the live VMM segments captured at checkpoint time.
+static void vmm_dump(void) {
+    pthread_mutex_lock(&g_vmm_lock);
+    size_t sn = atomic_load(&g_seg_n), live = 0, bytes = 0;
+    for (size_t i = 0; i < sn; i++) if (g_seg[i].live) { live++; bytes += g_seg[i].size; }
+    fprintf(stderr, "[gcr][vmm] checkpoint OBSERVE: %zu live segments, %zu bytes "
+                    "(phys handles seen=%zu, seg events=%zu)\n",
+            live, bytes, (size_t)atomic_load(&g_phys_n), sn);
+    size_t shown = 0;
+    for (size_t i = 0; i < sn && shown < 16; i++) if (g_seg[i].live) {
+        fprintf(stderr, "[gcr][vmm]   seg va=0x%llx size=%zu handle=%llu\n",
+                (unsigned long long)g_seg[i].va, g_seg[i].size, (unsigned long long)g_seg[i].handle);
+        shown++;
+    }
+    pthread_mutex_unlock(&g_vmm_lock);
+    fflush(stderr);
+}
+
+// ---- control channel ----------------------------------------------------
 static char g_ctrl_path[1024], g_info_path[1024], g_data_dir[1024];
 
 static void build_paths(void) {
@@ -68,71 +149,19 @@ static void write_signal(int v) {
     FILE *f = fopen(g_ctrl_path, "w"); if (!f) return; fprintf(f, "%d", v); fclose(f);
 }
 
-// lazily-resolved CUDA runtime fns for the D2H copy
-static int (*real_cudaSetDevice)(int) = NULL;
-static int (*real_cudaDeviceSynchronize)(void) = NULL;
-static int (*real_cudaMemcpy)(void *, const void *, size_t, int) = NULL;
-
-static void resolve_rt(void) {
-    if (!real_cudaSetDevice)        real_cudaSetDevice        = (int (*)(int))dlsym(RTLD_NEXT, "cudaSetDevice");
-    if (!real_cudaDeviceSynchronize)real_cudaDeviceSynchronize= (int (*)(void))dlsym(RTLD_NEXT, "cudaDeviceSynchronize");
-    if (!real_cudaMemcpy)           real_cudaMemcpy           = (int (*)(void *, const void *, size_t, int))dlsym(RTLD_NEXT, "cudaMemcpy");
-}
-
-// SELECTIVE DATA-BUFFER CHECKPOINT: copy tracked GPU buffers D->H into storage.
-// Returns total bytes copied, or -1 if the copy path is unavailable.
-static long long checkpoint_data_buffers(void) {
-    resolve_rt();
-    if (!real_cudaMemcpy || !real_cudaDeviceSynchronize) {
-        fprintf(stderr, "[gcr] cudaMemcpy not resolvable; skipping in-process data copy\n");
-        return -1;
-    }
-    mkdir(g_data_dir, 0755);
-    char path[1100];
-    snprintf(path, sizeof(path), "%s/data-checkpoint.bin", g_data_dir);
-    FILE *out = fopen(path, "wb");
-    if (!out) { fprintf(stderr, "[gcr] cannot open %s\n", path); return -1; }
-
-    if (real_cudaSetDevice) real_cudaSetDevice(0);
-    real_cudaDeviceSynchronize();
-
-    void *host = malloc(CHUNK);
-    if (!host) { fclose(out); return -1; }
-
-    long long total = 0; size_t nbuf = 0;
-    pthread_mutex_lock(&g_lock);
-    size_t n = atomic_load(&g_count);
-    for (size_t i = 0; i < n; i++) {
-        if (!g_allocs[i].live) continue;
-        void *dptr = g_allocs[i].ptr; size_t size = g_allocs[i].size;
-        // record: [ptr(8)][size(8)] then raw bytes
-        uint64_t hp = (uint64_t)(uintptr_t)dptr, hs = (uint64_t)size;
-        fwrite(&hp, sizeof(hp), 1, out); fwrite(&hs, sizeof(hs), 1, out);
-        size_t off = 0; int ok = 1;
-        while (off < size) {
-            size_t c = (size - off < CHUNK) ? (size - off) : CHUNK;
-            int rc = real_cudaMemcpy(host, (const char *)dptr + off, c, CUDA_MEMCPY_D2H);
-            if (rc != 0) { fprintf(stderr, "[gcr] cudaMemcpy D2H failed (rc=%d) for %p\n", rc, dptr); ok = 0; break; }
-            fwrite(host, 1, c, out);
-            off += c;
-        }
-        if (ok) { total += (long long)size; nbuf++; }
-    }
-    pthread_mutex_unlock(&g_lock);
-    free(host); fclose(out);
-    fprintf(stderr, "[gcr] selective data-buffer checkpoint: %zu buffers, %lld bytes -> %s\n",
-            nbuf, total, path);
-    return total;
-}
-
-static void dump_intercepted_info(long long copied) {
+static void dump_intercepted_info(void) {
     FILE *f = fopen(g_info_path, "w"); if (!f) return;
     pthread_mutex_lock(&g_lock);
     size_t n = atomic_load(&g_count), live = 0, bytes = 0;
-    fprintf(f, "# GCR intercepted GPU buffers (pid=%d)\n# ptr size_bytes\n", (int)getpid());
-    for (size_t i = 0; i < n; i++) if (g_allocs[i].live) { fprintf(f, "%p %zu\n", g_allocs[i].ptr, g_allocs[i].size); live++; bytes += g_allocs[i].size; }
-    fprintf(f, "# live_buffers=%zu live_bytes=%zu copied_bytes=%lld\n", live, bytes, copied);
+    for (size_t i = 0; i < n; i++) if (g_allocs[i].live) { live++; bytes += g_allocs[i].size; }
     pthread_mutex_unlock(&g_lock);
+    pthread_mutex_lock(&g_vmm_lock);
+    size_t sn = atomic_load(&g_seg_n), vlive = 0, vbytes = 0;
+    for (size_t i = 0; i < sn; i++) if (g_seg[i].live) { vlive++; vbytes += g_seg[i].size; }
+    pthread_mutex_unlock(&g_vmm_lock);
+    fprintf(f, "# GCR intercepted (pid=%d)\n", (int)getpid());
+    fprintf(f, "legacy_live_buffers=%zu legacy_live_bytes=%zu\n", live, bytes);
+    fprintf(f, "vmm_live_segments=%zu vmm_live_bytes=%zu\n", vlive, vbytes);
     fclose(f);
 }
 
@@ -140,12 +169,12 @@ static void *watcher(void *arg) {
     (void)arg;
     for (;;) {
         if (read_signal() == GCR_CKPT) {
-            fprintf(stderr, "[gcr] checkpoint signal received; selective data-buffer checkpoint\n");
+            fprintf(stderr, "[gcr] checkpoint signal received (STEP 1: observe VMM, no copy)\n");
             fflush(stderr);
-            long long copied = checkpoint_data_buffers();
-            dump_intercepted_info(copied);
+            vmm_dump();              // <-- the new Level-1 observation
+            dump_intercepted_info();
             write_signal(GCR_IDLE);
-            fprintf(stderr, "[gcr] data-buffer checkpoint ACK sent (copied=%lld bytes)\n", copied);
+            fprintf(stderr, "[gcr] checkpoint ACK sent\n");
             fflush(stderr);
         }
         usleep(50 * 1000);
@@ -157,12 +186,12 @@ __attribute__((constructor)) static void gcr_init(void) {
     build_paths();
     pthread_t t;
     if (pthread_create(&t, NULL, watcher, NULL) == 0) pthread_detach(t);
-    fprintf(stderr, "[gcr] interceptor loaded (pid=%d): ctrl=%s data=%s\n",
+    fprintf(stderr, "[gcr] interceptor loaded (pid=%d): ctrl=%s data=%s [VMM hooks active]\n",
             (int)getpid(), g_ctrl_path, g_data_dir);
     fflush(stderr);
 }
 
-// ---- intercepted CUDA memory APIs ----
+// ---- legacy intercepted CUDA memory APIs --------------------------------
 static int (*real_cudaMalloc)(void **, size_t) = NULL;
 int cudaMalloc(void **devPtr, size_t size) {
     if (!real_cudaMalloc) real_cudaMalloc = (int (*)(void **, size_t))dlsym(RTLD_NEXT, "cudaMalloc");
@@ -188,4 +217,44 @@ int cuMemFree_v2(unsigned long long dptr) {
     if (!real_cuMemFree) real_cuMemFree = (int (*)(unsigned long long))dlsym(RTLD_NEXT, "cuMemFree_v2");
     reg_del((void *)(uintptr_t)dptr);
     return real_cuMemFree(dptr);
+}
+
+// ---- VMM intercepted APIs (Level 1, step 1: observe) --------------------
+static CUresult_t (*real_cuMemCreate)(CUmemHandle_t *, size_t, const void *, unsigned long long) = NULL;
+CUresult_t cuMemCreate(CUmemHandle_t *handle, size_t size, const void *prop, unsigned long long flags) {
+    if (!real_cuMemCreate) real_cuMemCreate = (CUresult_t (*)(CUmemHandle_t *, size_t, const void *, unsigned long long))dlsym(RTLD_NEXT, "cuMemCreate");
+    CUresult_t rc = real_cuMemCreate(handle, size, prop, flags);
+    if (rc == 0 && handle) vmm_phys_add(*handle, size, prop);
+    return rc;
+}
+static CUresult_t (*real_cuMemMap)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long) = NULL;
+CUresult_t cuMemMap(CUdeviceptr_t ptr, size_t size, size_t offset, CUmemHandle_t handle, unsigned long long flags) {
+    if (!real_cuMemMap) real_cuMemMap = (CUresult_t (*)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long))dlsym(RTLD_NEXT, "cuMemMap");
+    CUresult_t rc = real_cuMemMap(ptr, size, offset, handle, flags);
+    if (rc == 0) vmm_seg_add(ptr, size, offset, handle);
+    return rc;
+}
+static CUresult_t (*real_cuMemUnmap)(CUdeviceptr_t, size_t) = NULL;
+CUresult_t cuMemUnmap(CUdeviceptr_t ptr, size_t size) {
+    if (!real_cuMemUnmap) real_cuMemUnmap = (CUresult_t (*)(CUdeviceptr_t, size_t))dlsym(RTLD_NEXT, "cuMemUnmap");
+    vmm_seg_del(ptr);
+    return real_cuMemUnmap(ptr, size);
+}
+static CUresult_t (*real_cuMemRelease)(CUmemHandle_t) = NULL;
+CUresult_t cuMemRelease(CUmemHandle_t handle) {
+    if (!real_cuMemRelease) real_cuMemRelease = (CUresult_t (*)(CUmemHandle_t))dlsym(RTLD_NEXT, "cuMemRelease");
+    vmm_phys_del(handle);
+    return real_cuMemRelease(handle);
+}
+static CUresult_t (*real_cuMemAddressReserve)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long) = NULL;
+CUresult_t cuMemAddressReserve(CUdeviceptr_t *ptr, size_t size, size_t alignment, CUdeviceptr_t addr, unsigned long long flags) {
+    if (!real_cuMemAddressReserve) real_cuMemAddressReserve = (CUresult_t (*)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long))dlsym(RTLD_NEXT, "cuMemAddressReserve");
+    CUresult_t rc = real_cuMemAddressReserve(ptr, size, alignment, addr, flags);
+    if (rc == 0 && ptr) { fprintf(stderr, "[gcr][vmm] cuMemAddressReserve va=0x%llx size=%zu\n", (unsigned long long)*ptr, size); fflush(stderr); }
+    return rc;
+}
+static CUresult_t (*real_cuMemAddressFree)(CUdeviceptr_t, size_t) = NULL;
+CUresult_t cuMemAddressFree(CUdeviceptr_t ptr, size_t size) {
+    if (!real_cuMemAddressFree) real_cuMemAddressFree = (CUresult_t (*)(CUdeviceptr_t, size_t))dlsym(RTLD_NEXT, "cuMemAddressFree");
+    return real_cuMemAddressFree(ptr, size);
 }
