@@ -174,10 +174,42 @@ systemctl is-active --quiet kubelet && log "kubelet active" || warn "kubelet not
 # 8) GPU C/R runtime dirs on the boot disk (no relocation needed @300GB).
 #    These match the hostPath mounts in deploy/daemonset-crio.yaml + sample pod.
 # -----------------------------------------------------------------------------
-log "8/8  GPU C/R host directories"
+log "8/9  GPU C/R host directories"
 mkdir -p /var/lib/gpu-cr/lib /var/lib/gpu-cr/run \
-         /var/lib/gcr-checkpoint /var/lib/kubelet/checkpoints
-chmod 0755 /var/lib/gpu-cr /var/lib/gpu-cr/lib /var/lib/gpu-cr/run /var/lib/gcr-checkpoint
+         /var/lib/gcr-checkpoint /var/lib/kubelet/checkpoints /var/lib/gpu-cr/cuda-req
+chmod 0755 /var/lib/gpu-cr /var/lib/gpu-cr/lib /var/lib/gpu-cr/run /var/lib/gcr-checkpoint /var/lib/gpu-cr/cuda-req
+
+# -----------------------------------------------------------------------------
+# 9) cuda-checkpoint HOST helper service. The node agent runs in a container
+#    where cuda-checkpoint stack-smashes (glibc ABI mismatch). The agent writes
+#    requests to /var/lib/gpu-cr/cuda-req and this host service executes
+#    cuda-checkpoint natively against the real GPU PID in the container subtree.
+# -----------------------------------------------------------------------------
+log "9/9  cuda-checkpoint host helper service"
+HELPER_SRC="$(dirname "$(readlink -f "$0")")/gpu-cr-cuda-helper.sh"
+if [ -f "$HELPER_SRC" ]; then
+  install -m 0755 "$HELPER_SRC" /usr/local/bin/gpu-cr-cuda-helper.sh
+  cat > /etc/systemd/system/gpu-cr-cuda-helper.service <<UNIT
+[Unit]
+Description=GPU C/R cuda-checkpoint host helper
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/bin/gpu-cr-cuda-helper.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now gpu-cr-cuda-helper.service
+  systemctl is-active --quiet gpu-cr-cuda-helper.service \
+    && log "cuda helper service active" \
+    || warn "cuda helper not active — check: journalctl -u gpu-cr-cuda-helper -n 30"
+else
+  warn "gpu-cr-cuda-helper.sh not found next to this script; copy it to /usr/local/bin and create the service manually."
+fi
 
 log "DONE. Worker is ready. Summary:"
 echo "  driver         : $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
@@ -185,6 +217,7 @@ echo "  cuda-checkpoint: $(command -v cuda-checkpoint)"
 echo "  criu           : $(criu --version 2>/dev/null | head -1)"
 echo "  crio           : $(systemctl is-active crio)"
 echo "  kubelet gate   : ContainerCheckpoint=true"
+echo "  cuda helper    : $(systemctl is-active gpu-cr-cuda-helper 2>/dev/null)"
 echo "  dirs           : /var/lib/{gpu-cr,gcr-checkpoint,kubelet/checkpoints}"
 echo
 echo "Next: from the MASTER, label this node so the agent schedules on it:"

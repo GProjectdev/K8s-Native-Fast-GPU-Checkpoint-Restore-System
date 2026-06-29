@@ -56,6 +56,12 @@ type Checkpointer struct {
 	// part of the container checkpoint (the CRIUgpu approach). Use this when the
 	// agent cannot run cuda-checkpoint cross-namespace.
 	SkipCudaCheckpoint bool
+	// CudaHelperDir, when set, makes the agent delegate cuda-checkpoint to a
+	// HOST-side helper (gpu-cr-cuda-helper.service) by writing a request file
+	// here instead of exec'ing cuda-checkpoint in-container (which stack-smashes
+	// due to a glibc ABI mismatch). The helper also resolves the real GPU PID
+	// in the container's subtree, so we pass the container init PID.
+	CudaHelperDir string
 
 	run commandRunner
 }
@@ -170,6 +176,11 @@ func (c *Checkpointer) cudaToggle(ctx context.Context, pid int) error {
 	if c.DryRun || pid <= 0 || c.SkipCudaCheckpoint {
 		return nil
 	}
+	// Preferred path: a HOST helper runs cuda-checkpoint natively (in-container
+	// execution stack-smashes). It targets the GPU PID in the container subtree.
+	if c.CudaHelperDir != "" {
+		return c.cudaHelperToggle(ctx, pid)
+	}
 	name := c.CudaCheckpointBin
 	args := []string{"--toggle", "--pid", fmt.Sprintf("%d", pid)}
 	if c.Nsenter {
@@ -188,6 +199,47 @@ func (c *Checkpointer) cudaToggle(ctx context.Context, pid int) error {
 		return fmt.Errorf("%s: %v (%s)", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// cudaHelperToggle delegates the cuda-checkpoint toggle to the host-side helper.
+// containerPID is the container's init PID; the helper resolves the actual
+// GPU-using PID(s) in its subtree and toggles them on the host.
+func (c *Checkpointer) cudaHelperToggle(ctx context.Context, containerPID int) error {
+	if err := os.MkdirAll(c.CudaHelperDir, 0o755); err != nil {
+		return fmt.Errorf("cuda helper dir: %w", err)
+	}
+	id := fmt.Sprintf("%d-%d", containerPID, time.Now().UnixNano())
+	reqPath := filepath.Join(c.CudaHelperDir, id+".req")
+	resPath := filepath.Join(c.CudaHelperDir, id+".res")
+	if err := os.WriteFile(reqPath, []byte(fmt.Sprintf("toggle %d\n", containerPID)), 0o644); err != nil {
+		return fmt.Errorf("write cuda helper request: %w", err)
+	}
+	defer os.Remove(resPath)
+	deadline := time.Now().Add(120 * time.Second)
+	for {
+		if b, err := os.ReadFile(resPath); err == nil {
+			parts := strings.SplitN(string(b), "\n", 2)
+			rc := strings.TrimSpace(parts[0])
+			detail := ""
+			if len(parts) > 1 {
+				detail = strings.TrimSpace(parts[1])
+			}
+			if rc != "0" {
+				return fmt.Errorf("cuda helper rc=%s: %s", rc, detail)
+			}
+			klog.V(2).Infof("cuda helper ok (container pid %d): %s", containerPID, detail)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			_ = os.Remove(reqPath)
+			return fmt.Errorf("cuda helper timeout (pid %d); is gpu-cr-cuda-helper.service running on the node?", containerPID)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // store moves/copies the produced archive(s) into the CR-defined backend path

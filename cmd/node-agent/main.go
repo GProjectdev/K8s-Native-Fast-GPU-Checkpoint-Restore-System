@@ -111,6 +111,9 @@ func main() {
 	if os.Getenv("CUDA_CHECKPOINT_SKIP") == "true" {
 		cp.SkipCudaCheckpoint = true
 	}
+	if v := os.Getenv("CUDA_CHECKPOINT_HELPER_DIR"); v != "" {
+		cp.CudaHelperDir = v
+	}
 	r := &agent.Reconciler{
 		Client:       mgr.GetClient(),
 		NodeName:     nodeName,
