@@ -28,6 +28,15 @@
 #define GCR_CKPT 1
 #define GCR_RESTORE 2
 
+// ---- real dlsym (to call through our own dlsym override without recursion) ----
+static void *(*real_dlsym)(void *, const char *) = NULL;
+static void ensure_real_dlsym(void) {
+    if (real_dlsym) return;
+    real_dlsym = (void *(*)(void *, const char *))dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (!real_dlsym) real_dlsym = (void *(*)(void *, const char *))dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+}
+static void *gcr_next(const char *sym) { ensure_real_dlsym(); return real_dlsym ? real_dlsym(RTLD_NEXT, sym) : NULL; }
+
 // ---- CUDA VMM ABI (declared locally; no CUDA headers) -------------------
 typedef int                CUresult_t;     // CUresult enum -> int
 typedef unsigned long long CUdeviceptr_t;  // 64-bit device pointer
@@ -183,6 +192,7 @@ static void *watcher(void *arg) {
 }
 
 __attribute__((constructor)) static void gcr_init(void) {
+    ensure_real_dlsym();
     build_paths();
     pthread_t t;
     if (pthread_create(&t, NULL, watcher, NULL) == 0) pthread_detach(t);
@@ -194,27 +204,27 @@ __attribute__((constructor)) static void gcr_init(void) {
 // ---- legacy intercepted CUDA memory APIs --------------------------------
 static int (*real_cudaMalloc)(void **, size_t) = NULL;
 int cudaMalloc(void **devPtr, size_t size) {
-    if (!real_cudaMalloc) real_cudaMalloc = (int (*)(void **, size_t))dlsym(RTLD_NEXT, "cudaMalloc");
+    if (!real_cudaMalloc) real_cudaMalloc = (int (*)(void **, size_t))gcr_next("cudaMalloc");
     int rc = real_cudaMalloc(devPtr, size);
     if (rc == 0 && devPtr) reg_add(*devPtr, size);
     return rc;
 }
 static int (*real_cudaFree)(void *) = NULL;
 int cudaFree(void *devPtr) {
-    if (!real_cudaFree) real_cudaFree = (int (*)(void *))dlsym(RTLD_NEXT, "cudaFree");
+    if (!real_cudaFree) real_cudaFree = (int (*)(void *))gcr_next("cudaFree");
     reg_del(devPtr);
     return real_cudaFree(devPtr);
 }
 static int (*real_cuMemAlloc)(unsigned long long *, size_t) = NULL;
 int cuMemAlloc_v2(unsigned long long *dptr, size_t bytesize) {
-    if (!real_cuMemAlloc) real_cuMemAlloc = (int (*)(unsigned long long *, size_t))dlsym(RTLD_NEXT, "cuMemAlloc_v2");
+    if (!real_cuMemAlloc) real_cuMemAlloc = (int (*)(unsigned long long *, size_t))gcr_next("cuMemAlloc_v2");
     int rc = real_cuMemAlloc(dptr, bytesize);
     if (rc == 0 && dptr) reg_add((void *)(uintptr_t)(*dptr), bytesize);
     return rc;
 }
 static int (*real_cuMemFree)(unsigned long long) = NULL;
 int cuMemFree_v2(unsigned long long dptr) {
-    if (!real_cuMemFree) real_cuMemFree = (int (*)(unsigned long long))dlsym(RTLD_NEXT, "cuMemFree_v2");
+    if (!real_cuMemFree) real_cuMemFree = (int (*)(unsigned long long))gcr_next("cuMemFree_v2");
     reg_del((void *)(uintptr_t)dptr);
     return real_cuMemFree(dptr);
 }
@@ -222,39 +232,57 @@ int cuMemFree_v2(unsigned long long dptr) {
 // ---- VMM intercepted APIs (Level 1, step 1: observe) --------------------
 static CUresult_t (*real_cuMemCreate)(CUmemHandle_t *, size_t, const void *, unsigned long long) = NULL;
 CUresult_t cuMemCreate(CUmemHandle_t *handle, size_t size, const void *prop, unsigned long long flags) {
-    if (!real_cuMemCreate) real_cuMemCreate = (CUresult_t (*)(CUmemHandle_t *, size_t, const void *, unsigned long long))dlsym(RTLD_NEXT, "cuMemCreate");
+    if (!real_cuMemCreate) real_cuMemCreate = (CUresult_t (*)(CUmemHandle_t *, size_t, const void *, unsigned long long))gcr_next("cuMemCreate");
     CUresult_t rc = real_cuMemCreate(handle, size, prop, flags);
     if (rc == 0 && handle) vmm_phys_add(*handle, size, prop);
     return rc;
 }
 static CUresult_t (*real_cuMemMap)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long) = NULL;
 CUresult_t cuMemMap(CUdeviceptr_t ptr, size_t size, size_t offset, CUmemHandle_t handle, unsigned long long flags) {
-    if (!real_cuMemMap) real_cuMemMap = (CUresult_t (*)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long))dlsym(RTLD_NEXT, "cuMemMap");
+    if (!real_cuMemMap) real_cuMemMap = (CUresult_t (*)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long))gcr_next("cuMemMap");
     CUresult_t rc = real_cuMemMap(ptr, size, offset, handle, flags);
     if (rc == 0) vmm_seg_add(ptr, size, offset, handle);
     return rc;
 }
 static CUresult_t (*real_cuMemUnmap)(CUdeviceptr_t, size_t) = NULL;
 CUresult_t cuMemUnmap(CUdeviceptr_t ptr, size_t size) {
-    if (!real_cuMemUnmap) real_cuMemUnmap = (CUresult_t (*)(CUdeviceptr_t, size_t))dlsym(RTLD_NEXT, "cuMemUnmap");
+    if (!real_cuMemUnmap) real_cuMemUnmap = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_next("cuMemUnmap");
     vmm_seg_del(ptr);
     return real_cuMemUnmap(ptr, size);
 }
 static CUresult_t (*real_cuMemRelease)(CUmemHandle_t) = NULL;
 CUresult_t cuMemRelease(CUmemHandle_t handle) {
-    if (!real_cuMemRelease) real_cuMemRelease = (CUresult_t (*)(CUmemHandle_t))dlsym(RTLD_NEXT, "cuMemRelease");
+    if (!real_cuMemRelease) real_cuMemRelease = (CUresult_t (*)(CUmemHandle_t))gcr_next("cuMemRelease");
     vmm_phys_del(handle);
     return real_cuMemRelease(handle);
 }
 static CUresult_t (*real_cuMemAddressReserve)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long) = NULL;
 CUresult_t cuMemAddressReserve(CUdeviceptr_t *ptr, size_t size, size_t alignment, CUdeviceptr_t addr, unsigned long long flags) {
-    if (!real_cuMemAddressReserve) real_cuMemAddressReserve = (CUresult_t (*)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long))dlsym(RTLD_NEXT, "cuMemAddressReserve");
+    if (!real_cuMemAddressReserve) real_cuMemAddressReserve = (CUresult_t (*)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long))gcr_next("cuMemAddressReserve");
     CUresult_t rc = real_cuMemAddressReserve(ptr, size, alignment, addr, flags);
     if (rc == 0 && ptr) { fprintf(stderr, "[gcr][vmm] cuMemAddressReserve va=0x%llx size=%zu\n", (unsigned long long)*ptr, size); fflush(stderr); }
     return rc;
 }
 static CUresult_t (*real_cuMemAddressFree)(CUdeviceptr_t, size_t) = NULL;
 CUresult_t cuMemAddressFree(CUdeviceptr_t ptr, size_t size) {
-    if (!real_cuMemAddressFree) real_cuMemAddressFree = (CUresult_t (*)(CUdeviceptr_t, size_t))dlsym(RTLD_NEXT, "cuMemAddressFree");
+    if (!real_cuMemAddressFree) real_cuMemAddressFree = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_next("cuMemAddressFree");
     return real_cuMemAddressFree(ptr, size);
+}
+
+
+// ---- dlsym interceptor: redirect PyTorch's libcuda VMM lookups to our wrappers.
+// PyTorch resolves cuMem* via dlsym(libcuda_handle, "cuMemCreate"), which bypasses
+// normal LD_PRELOAD symbol interposition. We intercept dlsym so those lookups
+// return OUR wrappers; everything else passes through to the real dlsym.
+void *dlsym(void *handle, const char *symbol) {
+    ensure_real_dlsym();
+    if (symbol) {
+        if (!strcmp(symbol, "cuMemCreate"))         { return (void *)cuMemCreate; }
+        if (!strcmp(symbol, "cuMemMap"))            { return (void *)cuMemMap; }
+        if (!strcmp(symbol, "cuMemUnmap"))          { return (void *)cuMemUnmap; }
+        if (!strcmp(symbol, "cuMemRelease"))        { return (void *)cuMemRelease; }
+        if (!strcmp(symbol, "cuMemAddressReserve")) { return (void *)cuMemAddressReserve; }
+        if (!strcmp(symbol, "cuMemAddressFree"))    { return (void *)cuMemAddressFree; }
+    }
+    return real_dlsym ? real_dlsym(handle, symbol) : NULL;
 }
