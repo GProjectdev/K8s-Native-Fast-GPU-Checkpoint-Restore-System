@@ -11,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	gpucrv1alpha1 "github.com/GProjectdev/K8s-Native-Fast-GPU-Checkpoint-Restore-System/api/v1alpha1"
 )
@@ -162,5 +163,10 @@ func setCondition(status *gpucrv1alpha1.GPUCheckpointStatus, condType string, s 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gpucrv1alpha1.GPUCheckpoint{}).
+		// Only reconcile on spec changes (create/spec-update) and our own
+		// RequeueAfter timers — NOT on our own status writes, which would
+		// otherwise retrigger reconcile in a tight loop and repeatedly toggle
+		// cuda-checkpoint, crashing the workload.
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }
