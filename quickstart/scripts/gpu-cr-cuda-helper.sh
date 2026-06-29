@@ -31,11 +31,23 @@ is_descendant() {  # anc pid  -> 0 if pid == anc or a descendant of anc
   return 1
 }
 
-gpu_pids_under() {  # container_pid -> GPU pids in its subtree
-  local cpid=$1 pid
-  for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | tr -d ' '); do
-    [ -n "$pid" ] || continue
-    is_descendant "$cpid" "$pid" && echo "$pid"
+list_descendant_pids() {  # anc -> every pid in its subtree (incl. anc)
+  local anc=$1 d pid
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    is_descendant "$anc" "$pid" && echo "$pid"
+  done
+}
+
+# Find the CUDA process(es) under the container by probing cuda-checkpoint
+# --get-state (exit 0 only for a real CUDA process). Unlike nvidia-smi this also
+# finds an already-suspended/checkpointed process (no GPU memory) so RESUME works.
+gpu_pids_under() {  # container_pid -> CUDA pids in its subtree
+  local cpid=$1 pid st
+  for pid in $(list_descendant_pids "$cpid"); do
+    if st=$(timeout 5 "$BIN" --get-state --pid "$pid" 2>/dev/null) && [ -n "$st" ]; then
+      echo "$pid"
+    fi
   done
 }
 
