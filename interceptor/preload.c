@@ -242,26 +242,33 @@ static void resolve_vmm_real(void) {
 // Returns 0 on success (and sets *devPtr), -1 to fall back to the real cudaMalloc.
 static int gcr_vmm_alloc(void **devPtr, size_t size) {
     resolve_vmm_real();
-    if (!r_cuMemCreate || !r_cuMemMap || !r_cuMemAddressReserve || !r_cuMemSetAccess || !r_cuMemGetAllocationGranularity)
+    if (!r_cuMemCreate || !r_cuMemMap || !r_cuMemAddressReserve || !r_cuMemSetAccess || !r_cuMemGetAllocationGranularity) {
+        fprintf(stderr, "[gcr][vmm-alloc] unresolved syms: gran=%p reserve=%p create=%p map=%p setacc=%p getdev=%p\n",
+                (void*)r_cuMemGetAllocationGranularity, (void*)r_cuMemAddressReserve, (void*)r_cuMemCreate,
+                (void*)r_cuMemMap, (void*)r_cuMemSetAccess, (void*)r_cudaGetDevice);
+        fflush(stderr);
         return -1;
+    }
     int dev = 0; if (r_cudaGetDevice) r_cudaGetDevice(&dev);
     gcr_mem_prop_t prop; memset(&prop, 0, sizeof(prop));
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = dev;
     size_t gran = 0;
-    if (r_cuMemGetAllocationGranularity(&gran, &prop, 0) != 0 || gran == 0) gran = (2UL << 20);
+    CUresult_t rg = r_cuMemGetAllocationGranularity(&gran, &prop, 0);
+    if (rg != 0 || gran == 0) { fprintf(stderr, "[gcr][vmm-alloc] granularity rc=%d gran=%zu (dev=%d)\n", rg, gran, dev); if (gran == 0) gran = (2UL << 20); }
     size_t padded = ((size + gran - 1) / gran) * gran;
     if (padded == 0) padded = gran;
     CUmemHandle_t handle = 0;
-    if (r_cuMemCreate(&handle, padded, &prop, 0) != 0) return -1;
+    CUresult_t rc;
+    if ((rc = r_cuMemCreate(&handle, padded, &prop, 0)) != 0) { fprintf(stderr, "[gcr][vmm-alloc] cuMemCreate rc=%d padded=%zu dev=%d\n", rc, padded, dev); fflush(stderr); return -1; }
     CUdeviceptr_t va = 0;
-    if (r_cuMemAddressReserve(&va, padded, 0, 0, 0) != 0) { r_cuMemRelease2(handle); return -1; }
-    if (r_cuMemMap(va, padded, 0, handle, 0) != 0) { r_cuMemAddressFree2(va, padded); r_cuMemRelease2(handle); return -1; }
+    if ((rc = r_cuMemAddressReserve(&va, padded, 0, 0, 0)) != 0) { fprintf(stderr, "[gcr][vmm-alloc] cuMemAddressReserve rc=%d\n", rc); fflush(stderr); r_cuMemRelease2(handle); return -1; }
+    if ((rc = r_cuMemMap(va, padded, 0, handle, 0)) != 0) { fprintf(stderr, "[gcr][vmm-alloc] cuMemMap rc=%d\n", rc); fflush(stderr); r_cuMemAddressFree2(va, padded); r_cuMemRelease2(handle); return -1; }
     gcr_access_desc_t desc; memset(&desc, 0, sizeof(desc));
     desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE; desc.location.id = dev;
     desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    if (r_cuMemSetAccess(va, padded, &desc, 1) != 0) { r_cuMemUnmap2(va, padded); r_cuMemAddressFree2(va, padded); r_cuMemRelease2(handle); return -1; }
+    if ((rc = r_cuMemSetAccess(va, padded, &desc, 1)) != 0) { fprintf(stderr, "[gcr][vmm-alloc] cuMemSetAccess rc=%d\n", rc); fflush(stderr); r_cuMemUnmap2(va, padded); r_cuMemAddressFree2(va, padded); r_cuMemRelease2(handle); return -1; }
     pthread_mutex_lock(&g_owned_lock);
     size_t n = atomic_load(&g_owned_n);
     if (n < GCR_MAX_VMM) { g_owned[n].va = va; g_owned[n].padded = padded; g_owned[n].req = size; g_owned[n].handle = handle; g_owned[n].prop = prop; g_owned[n].live = 1; atomic_store(&g_owned_n, n + 1); }
