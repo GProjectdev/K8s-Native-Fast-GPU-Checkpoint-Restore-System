@@ -159,23 +159,15 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 	}
 	klog.V(2).Infof("step 4/5 done: stored checkpoint at %s", stored)
 
-	// (5) Resume the workload so periodic checkpointing keeps the job alive.
-	if err := c.cudaToggle(ctx, t.HostPID); err != nil {
-		klog.Errorf("resume after checkpoint failed (job may be suspended): %v", err)
-	}
-	if c.GCRInterception {
-		// Remap GPU data buffers AFTER control state is resumed: recreate physical
-		// memory and map it back to the preserved virtual addresses, then copy the
-		// host-resident data back to the device.
-		if err := c.Interceptor.Signal(t.PodUID, GCRSignalRestore); err != nil {
-			klog.Errorf("signal GCR restore/remap failed: %v", err)
-		} else if !c.DryRun {
-			if err := c.Interceptor.WaitForAck(t.PodUID, 120*time.Second); err != nil {
-				klog.Errorf("GCR restore/remap did not ack: %v", err)
-			}
-		}
-	}
-	klog.Infof("step 5/5 done: workload resumed; checkpoint took %s", time.Since(start))
+	// (5) Checkpoint-only. The source is intentionally LEFT in the checkpointed
+	// (frozen) state: CUDA is suspended (cuda-checkpoint), the GPU data buffers are
+	// resident on the host, and their physical GPU memory has been released while
+	// the virtual addresses are preserved. RESTORE — cuda-checkpoint resume + GCR
+	// remap (recreate physical, map to the same VA, copy host->device) — is a
+	// SEPARATE, user-triggered operation (and tar->container restore needs CRI-O
+	// support). The interceptor exposes GCRSignalRestore for that manual trigger.
+	klog.Infof("step 5/5 done: checkpoint stored at %s; source left frozen (restore is triggered separately); took %s",
+		stored, time.Since(start))
 
 	return &Result{ArchivePath: stored, TakenAt: start}, nil
 }
