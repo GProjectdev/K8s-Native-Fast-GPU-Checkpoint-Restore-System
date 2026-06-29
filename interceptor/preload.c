@@ -227,15 +227,31 @@ static int        (*r_cudaGetDevice)(int *) = NULL;
 
 static int gcr_vmm_enabled(void) { const char *e = getenv("GCR_VMM_ALLOC"); return e && e[0] == '1'; }
 
+// Resolve a DRIVER (libcuda) symbol. libcuda is dlopen'd RTLD_LOCAL by cudart, so
+// it is NOT in the global scope reachable via RTLD_NEXT — we must open a handle to
+// libcuda.so.1 (already loaded; RTLD_NOLOAD returns it) and dlsym from it.
+static void *gcr_cuda_sym(const char *name) {
+    static void *libcuda = NULL;
+    if (!libcuda) {
+        libcuda = dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_LAZY);
+        if (!libcuda) libcuda = dlopen("libcuda.so.1", RTLD_LAZY);
+        if (!libcuda) libcuda = dlopen("libcuda.so", RTLD_LAZY);
+        if (libcuda) { fprintf(stderr, "[gcr] libcuda handle acquired\n"); fflush(stderr); }
+    }
+    if (!libcuda) return NULL;
+    ensure_real_dlsym();
+    return real_dlsym ? real_dlsym(libcuda, name) : dlsym(libcuda, name);
+}
+
 static void resolve_vmm_real(void) {
-    if (!r_cuMemGetAllocationGranularity) r_cuMemGetAllocationGranularity = (CUresult_t (*)(size_t *, const void *, int))gcr_next("cuMemGetAllocationGranularity");
-    if (!r_cuMemAddressReserve) r_cuMemAddressReserve = (CUresult_t (*)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long))gcr_next("cuMemAddressReserve");
-    if (!r_cuMemCreate)  r_cuMemCreate  = (CUresult_t (*)(CUmemHandle_t *, size_t, const void *, unsigned long long))gcr_next("cuMemCreate");
-    if (!r_cuMemMap)     r_cuMemMap     = (CUresult_t (*)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long))gcr_next("cuMemMap");
-    if (!r_cuMemSetAccess) r_cuMemSetAccess = (CUresult_t (*)(CUdeviceptr_t, size_t, const void *, size_t))gcr_next("cuMemSetAccess");
-    if (!r_cuMemUnmap2)  r_cuMemUnmap2  = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_next("cuMemUnmap");
-    if (!r_cuMemRelease2) r_cuMemRelease2 = (CUresult_t (*)(CUmemHandle_t))gcr_next("cuMemRelease");
-    if (!r_cuMemAddressFree2) r_cuMemAddressFree2 = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_next("cuMemAddressFree");
+    if (!r_cuMemGetAllocationGranularity) r_cuMemGetAllocationGranularity = (CUresult_t (*)(size_t *, const void *, int))gcr_cuda_sym("cuMemGetAllocationGranularity");
+    if (!r_cuMemAddressReserve) r_cuMemAddressReserve = (CUresult_t (*)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long))gcr_cuda_sym("cuMemAddressReserve");
+    if (!r_cuMemCreate)  r_cuMemCreate  = (CUresult_t (*)(CUmemHandle_t *, size_t, const void *, unsigned long long))gcr_cuda_sym("cuMemCreate");
+    if (!r_cuMemMap)     r_cuMemMap     = (CUresult_t (*)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long))gcr_cuda_sym("cuMemMap");
+    if (!r_cuMemSetAccess) r_cuMemSetAccess = (CUresult_t (*)(CUdeviceptr_t, size_t, const void *, size_t))gcr_cuda_sym("cuMemSetAccess");
+    if (!r_cuMemUnmap2)  r_cuMemUnmap2  = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_cuda_sym("cuMemUnmap");
+    if (!r_cuMemRelease2) r_cuMemRelease2 = (CUresult_t (*)(CUmemHandle_t))gcr_cuda_sym("cuMemRelease");
+    if (!r_cuMemAddressFree2) r_cuMemAddressFree2 = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_cuda_sym("cuMemAddressFree");
     if (!r_cudaGetDevice) r_cudaGetDevice = (int (*)(int *))gcr_next("cudaGetDevice");
 }
 
