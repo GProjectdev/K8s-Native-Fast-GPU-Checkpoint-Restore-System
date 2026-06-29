@@ -1,0 +1,15 @@
+# Checkpoint request for the minimal (no-interceptor) pod.
+apiVersion: gpu-cr.io/v1alpha1
+kind: GPUCheckpoint
+metadata:
+  name: ckpt-plain-001
+  namespace: default
+spec:
+  podRef:
+    namespace: default
+    name: cuda-plain-pod
+    container: cuda-app
+  storage:
+    type: hostPath
+    path: /var/lib/gcr-checkpoint
+  period: "000000"

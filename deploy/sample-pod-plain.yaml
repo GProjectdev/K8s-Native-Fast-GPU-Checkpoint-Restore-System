@@ -1,0 +1,27 @@
+# Minimal GPU pod — NO interceptor, NO GCR env. Used to isolate step3 (CRIU
+# container checkpoint) with the GPU handled by CRI-O+CRIU (CUDA_CHECKPOINT_SKIP
+# / CRIUgpu). Idle workload so it is trivially checkpointable.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cuda-plain-pod
+  namespace: default
+  labels:
+    app: cuda-plain
+spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  containers:
+    - name: cuda-app
+      image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+      command: ["python", "-c"]
+      args:
+        - |
+          import torch, time
+          x = torch.randn(2048, 2048, 256, device='cuda')   # ~4GB GPU memory
+          print("GPU tensor allocated:", x.shape, "device:", x.device, flush=True)
+          while True:
+              time.sleep(3600)
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
