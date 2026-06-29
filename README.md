@@ -6,11 +6,17 @@ per-node agent. This repository brings GCR's **control/data-separated hybrid
 C/R** into a Kubernetes cluster so that GPU Pods can be checkpointed
 transparently, on a schedule, without modifying the workload.
 
-> Status: **Phase 1** — `GPUCheckpoint` CR + `GPU C/R Node Agent` (checkpoint
-> path). There is **no separate GPU C/R Controller**: the `GPUCheckpoint` CR
-> carries everything required (`podRef.nodeInfo`, `storage`, `period`), and each
-> Node Agent **watches the CR directly** and acts on the ones targeting its own
-> node. The restore path (custom container runtime) is planned next
+> Status: **Checkpoint path verified end-to-end** on K8s v1.33 + CRI-O + NVIDIA
+> A100 (driver 570). The `GPUCheckpoint` CR + `GPU C/R Node Agent` perform the
+> full GCR pipeline: the interceptor **owns GPU memory via the CUDA VMM API**
+> (framework-agnostic — no `expandable_segments`), copies data to host and frees
+> physical memory while preserving virtual addresses; `cuda-checkpoint` handles
+> control state; **CRIU dumps CPU + host-resident data only** (the CRIU
+> `cuda_plugin` is disabled — CRIU never touches the GPU); then the source is
+> resumed and remapped. There is **no separate controller** — each Node Agent
+> watches the CR directly. **Follow [`docs/SETUP.ko.md`](docs/SETUP.ko.md) (KO) /
+> [`docs/SETUP.md`](docs/SETUP.md) (EN) to run it from a fresh VM.** Restore into
+> a NEW container (tar → container) needs CRI-O support and is next
 > (see [Roadmap](#roadmap)).
 
 > 🇰🇷 한국어 문서: [`README.ko.md`](README.ko.md)
@@ -72,19 +78,22 @@ and the control plane stays a single declarative CR.
 
 ### Checkpoint pipeline (per `GPUCheckpoint`)
 
-1. **Selective data-buffer checkpoint** — the agent signals the in-Pod GCR hook
-   (`internal/agent/interceptor.go`, GCR signal `1=ckpt`). The hook copies GPU
-   data buffers to host memory and releases/unmaps physical GPU memory while
-   keeping the virtual page table.
-2. **Control-state checkpoint** — `cuda-checkpoint --toggle --pid <pid>` suspends
-   CUDA in the process (driver-integrated path).
-3. **Container checkpoint** — the agent calls the **kubelet checkpoint API**
-   (`POST /checkpoint/{ns}/{pod}/{container}`), which drives CRIU to snapshot the
-   CPU-side process, including the host-resident GPU buffers.
-4. **Store** — the produced archive is written to the backend declared in
-   `.spec.storage`.
-5. **Resume** — the workload is resumed so periodic checkpointing keeps the job
-   alive.
+1. **Data-buffer freeze (GCR data engine)** — the in-Pod interceptor backs
+   `cudaMalloc` with the CUDA **VMM** API (`cuMemCreate/Map`), so it owns the GPU
+   memory. On the agent's checkpoint signal it copies each buffer **D2H into
+   process (host) memory**, then frees ONLY the physical memory
+   (`cuMemUnmap`/`cuMemRelease`) while **keeping the virtual address reservation**.
+2. **Control-state checkpoint** — a **host helper** runs
+   `cuda-checkpoint --toggle --pid <gpu-pid>` (in-container execution stack-smashes
+   on glibc mismatch; the helper runs it natively and targets the real GPU PID).
+3. **Container checkpoint** — the agent calls the **kubelet checkpoint API**, which
+   drives **CRIU (CPU only — `cuda_plugin` disabled)** to snapshot the process
+   including the host-resident GPU data. Needs **driver 570+** (so cuda-checkpoint
+   releases the `/dev/nvidia*` fds and CRIU can dump).
+4. **Store** — the archive is written to `.spec.storage`.
+5. **Resume (non-destructive)** — cuda-checkpoint resume, then the interceptor
+   **recreates physical memory and maps it to the same virtual address + H2D**, so
+   the source keeps running.
 
 ---
 
@@ -315,8 +324,29 @@ If any GPU/CRIU item is missing, you can still validate the orchestration with
 
 ## Quick start
 
-Make sure the [prerequisites](#prerequisites--server-setup) above are met. Use
-`--dry-run=true` to exercise the control flow on a cluster without GPUs.
+**To run from a fresh GPU VM, follow [`docs/SETUP.ko.md`](docs/SETUP.ko.md) (KO) /
+[`docs/SETUP.md`](docs/SETUP.md) (EN)** — they use the scripts in `quickstart/scripts/`
+(GPU worker prep incl. driver 570 + CRIU + cuda_plugin disable + host helper, and
+master deploy) and the verified run config. The condensed flow:
+
+```bash
+# worker (each, root): driver 570 + toolkit + CRIU + helper + plugin-off (one reboot)
+sudo bash quickstart/scripts/gpu-worker-setup.sh   # reboot, then re-run
+# master: device plugin + label + CRD/RBAC/DaemonSet, then set agent mode
+bash quickstart/scripts/master-deploy.sh
+kubectl -n gpu-cr-system set env ds/gpu-cr-node-agent GCR_INTERCEPTION=true CUDA_CHECKPOINT_SKIP=false
+# build the agent+interceptor image and roll out
+buildah bud -f Dockerfile -t docker.io/<you>/gpu-cr-node-agent:v1.0 . && buildah push docker.io/<you>/gpu-cr-node-agent:v1.0 docker://docker.io/<you>/gpu-cr-node-agent:v1.0
+kubectl -n gpu-cr-system rollout restart ds/gpu-cr-node-agent
+# run + checkpoint
+kubectl apply -f deploy/sample-pod-l1.yaml
+kubectl apply -f deploy/sample-gpucheckpoint-l1.yaml
+kubectl get gpucheckpoints.gpu-cr.io -w            # Completed
+```
+
+<details><summary>Legacy manual build steps (dev)</summary>
+
+Use `--dry-run=true` to exercise the control flow on a cluster without GPUs.
 
 ```bash
 # 1. Build the interceptor shim
@@ -347,6 +377,8 @@ kubectl get gpucheckpoints
 # ckpt-vllm-001   vllm-gcr-pod   gpu-node-1  000500   Completed   3       30s
 ```
 
+</details>
+
 ---
 
 ## Development
@@ -367,15 +399,15 @@ status updates, and the storage layout — useful for local/kind clusters.
 
 Tracks the three questions in the DCN Progress Report:
 
-1. **Integrate GCR into K8s** — `GPUCheckpoint` CR + Node Agent that watches the
-   CR directly (no separate controller) *(this phase)*; restore path via a custom
-   container runtime *(next)*.
-2. **PhOS concurrent checkpointing** — Copy-on-Write data-buffer checkpoint then
-   control-state checkpoint.
-3. **CRIUgpu integration** — alternative control-state checkpoint backend.
-
-Restore ordering (planned): **Control State → GPU Data Buffer**, triggered by a
-Restore Pod annotation handled by a custom CRI-O/runtime.
+1. **Integrate GCR into K8s** — `GPUCheckpoint` CR + Node Agent (no separate
+   controller). ✅ **Done & verified**: VMM-owned data engine (copy + physical-free +
+   address-preserving remap), cuda-checkpoint control, CRIU CPU-only, non-destructive
+   resume.
+2. **Restore into a NEW container (tar → container)** — needs CRI-O support to
+   reuse the checkpoint image; ordering **Control State → GPU Data Buffer**. *(next,
+   user-triggered)*
+3. **Incremental checkpointing** — shadow execution + dirty templates so only
+   modified buffers are stored (shrinks tar size). *(future)*
 
 ---
 

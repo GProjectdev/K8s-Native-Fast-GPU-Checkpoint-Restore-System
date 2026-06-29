@@ -211,6 +211,17 @@ else
   warn "gpu-cr-cuda-helper.sh not found next to this script; copy it to /usr/local/bin and create the service manually."
 fi
 
+# -----------------------------------------------------------------------------
+# 10) Disable the CRIU cuda_plugin (CRIUgpu). GCR drives the GPU itself: the
+#     interceptor handles data buffers and cuda-checkpoint handles control state,
+#     so CRIU must do CPU state ONLY. With the plugin enabled CRIU would try to
+#     checkpoint the GPU too (CRIUgpu) and clash. Disable it by renaming the .so.
+# -----------------------------------------------------------------------------
+log "10/10 disable CRIU cuda_plugin (CRIU does CPU only = GCR)"
+for so in $(find /usr/lib /usr/libexec /usr/local/lib -name 'cuda_plugin.so' 2>/dev/null); do
+  mv "$so" "$so.disabled" && log "disabled $so"
+done
+
 log "DONE. Worker is ready. Summary:"
 echo "  driver         : $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
 echo "  cuda-checkpoint: $(command -v cuda-checkpoint)"

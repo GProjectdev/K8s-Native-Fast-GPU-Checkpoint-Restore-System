@@ -6,11 +6,15 @@
 체크포인트할 수 있게 합니다. GCR의 **제어/데이터 분리 하이브리드 C/R**을
 쿠버네티스 환경으로 가져온 것이 핵심입니다.
 
-> 상태: **Phase 1** — `GPUCheckpoint` CR + `GPU C/R Node Agent` (체크포인트 경로).
-> **별도의 GPU C/R Controller는 없습니다.** `GPUCheckpoint` CR에 필요한 정보
-> (`podRef.nodeInfo`, `storage`, `period`)를 모두 담아두면, 각 Node Agent가 CR을
-> **직접 watch**하여 자신의 노드를 대상으로 하는 CR을 수행합니다. 복원 경로(custom
-> container runtime)는 다음 단계입니다. ([로드맵](#로드맵) 참고)
+> 상태: **체크포인트 경로 end-to-end 검증 완료** (K8s v1.33 + CRI-O + NVIDIA A100,
+> 드라이버 570). `GPUCheckpoint` CR + `GPU C/R Node Agent`가 GCR 전체 파이프라인을
+> 수행합니다: 인터셉터가 **CUDA VMM API로 GPU 메모리를 직접 소유**(프레임워크 무관 —
+> `expandable_segments` 불필요)하여 데이터를 host로 복사하고 물리메모리만 해제(가상주소
+> 보존), `cuda-checkpoint`가 control state, **CRIU는 CPU+host 데이터만** 덤프(CRIU
+> `cuda_plugin` 비활성화 → CRIU는 GPU를 안 건드림), 그다음 소스를 resume+remap. **별도
+> 컨트롤러 없음** — 각 Node Agent가 CR을 직접 watch. **새 VM부터 따라 실행하려면
+> [`docs/SETUP.ko.md`](docs/SETUP.ko.md)** 를 보세요. tar→새 컨테이너 복원은 CRI-O
+> 작업이 필요한 별개 단계입니다([로드맵](#로드맵)).
 
 본 작업의 기반:
 
@@ -68,18 +72,19 @@
 
 ### 체크포인트 파이프라인 (`GPUCheckpoint` 단위)
 
-1. **선택적 데이터버퍼 체크포인트** — 에이전트가 Pod 내부의 GCR hook에 시그널을
-   보냄 (`internal/agent/interceptor.go`, GCR 시그널 `1=ckpt`). hook은 GPU 데이터
-   버퍼를 호스트 메모리로 복사하고, 가상 페이지 테이블은 유지한 채 물리 GPU
-   메모리를 해제/언맵합니다.
-2. **제어 상태 체크포인트** — `cuda-checkpoint --toggle --pid <pid>`로 프로세스의
-   CUDA를 suspend (드라이버 통합 경로).
-3. **컨테이너 체크포인트** — 에이전트가 **kubelet 체크포인트 API**
-   (`POST /checkpoint/{ns}/{pod}/{container}`)를 호출, CRIU가 호스트로 옮겨진 GPU
-   버퍼를 포함해 CPU 측 프로세스를 스냅샷합니다.
-4. **저장** — 생성된 아카이브를 CR의 `.spec.storage`에 정의된 백엔드에 기록.
-5. **재개** — 워크로드를 다시 실행 상태로 되돌려, 주기적 체크포인팅이 작업을
-   종료시키지 않도록 합니다.
+1. **데이터버퍼 freeze (GCR 데이터 엔진)** — Pod 내부 인터셉터가 `cudaMalloc`을
+   CUDA **VMM**(`cuMemCreate/Map`)으로 백킹해 GPU 메모리를 직접 소유. 체크포인트 신호 시
+   각 버퍼를 **D2H로 프로세스(host) 메모리에 복사**하고, **물리메모리만 해제
+   (`cuMemUnmap`/`cuMemRelease`), 가상주소 예약은 보존**.
+2. **제어 상태 체크포인트** — **호스트 헬퍼**가 `cuda-checkpoint --toggle --pid <gpu-pid>`
+   실행(컨테이너 내부 실행은 glibc 불일치로 stack smashing → 헬퍼가 호스트에서 실제 GPU
+   PID 대상으로 실행).
+3. **컨테이너 체크포인트** — 에이전트가 **kubelet 체크포인트 API** 호출 →
+   **CRIU(CPU만 — `cuda_plugin` 비활성화)** 가 host에 올라온 GPU 데이터를 포함해 프로세스를
+   스냅샷. **드라이버 570+** 필요(cuda-checkpoint가 `/dev/nvidia*` fd까지 release해야 CRIU 성공).
+4. **저장** — 아카이브를 `.spec.storage`에 기록.
+5. **재개(비파괴적)** — cuda-checkpoint resume → 인터셉터가 **물리 재생성 + 같은 VA로 map +
+   H2D** → 소스 계속 실행.
 
 ---
 
@@ -305,11 +310,26 @@ GPU/CRIU 항목이 빠져 있어도 `--dry-run=true`로 오케스트레이션은
 
 ## 빠른 시작
 
-위 [사전 준비](#사전-준비--서버-설정)가 끝났다고 가정합니다. GPU가 없는
-클러스터에서는 `--dry-run=true`로 제어 흐름만 점검할 수 있습니다.
+**새 GPU VM부터 따라 실행하려면 [`docs/SETUP.ko.md`](docs/SETUP.ko.md)** 를 보세요.
+`quickstart/scripts/`의 스크립트(드라이버 570 + CRIU + cuda_plugin 비활성화 + 호스트 헬퍼
+포함 워커 준비, 마스터 배포)와 검증된 실행 구성을 사용합니다. 요약:
 
-이미지 빌드는 **Buildah**를 사용합니다(데몬 불필요, 루트리스 가능). `Dockerfile`은
-Buildah의 `Containerfile`로 그대로 사용됩니다.
+```bash
+# 각 워커(root): 드라이버 570 + toolkit + CRIU + 헬퍼 + plugin-off (재부팅 1회)
+sudo bash quickstart/scripts/gpu-worker-setup.sh   # 재부팅 후 재실행
+# 마스터: device plugin + 라벨 + CRD/RBAC/DaemonSet, 그다음 에이전트 모드 설정
+bash quickstart/scripts/master-deploy.sh
+kubectl -n gpu-cr-system set env ds/gpu-cr-node-agent GCR_INTERCEPTION=true CUDA_CHECKPOINT_SKIP=false
+# 이미지(에이전트+인터셉터) 빌드/롤아웃
+buildah bud -f Dockerfile -t docker.io/<you>/gpu-cr-node-agent:v1.0 . && buildah push docker.io/<you>/gpu-cr-node-agent:v1.0 docker://docker.io/<you>/gpu-cr-node-agent:v1.0
+kubectl -n gpu-cr-system rollout restart ds/gpu-cr-node-agent
+# 실행 + 체크포인트
+kubectl apply -f deploy/sample-pod-l1.yaml
+kubectl apply -f deploy/sample-gpucheckpoint-l1.yaml
+kubectl get gpucheckpoints.gpu-cr.io -w            # Completed
+```
+
+<details><summary>레거시 수동 빌드 절차 (개발용)</summary>
 
 ```bash
 # 1. 인터셉터 shim 빌드
@@ -351,6 +371,8 @@ kubectl get gpucheckpoints
 - 멀티 아키텍처가 필요하면 `buildah bud --platform=linux/amd64` 등으로 지정합니다.
 - 빌드 결과를 로컬 컨테이너 스토리지에서 확인: `buildah images`.
 
+</details>
+
 ---
 
 ## 개발
@@ -372,13 +394,12 @@ make -C interceptor      # libgcr-interceptor.so 빌드
 DCN Progress Report의 세 가지 질문을 따릅니다.
 
 1. **GCR의 K8s 통합** — `GPUCheckpoint` CR + CR을 직접 watch하는 Node Agent(별도
-   컨트롤러 없음) *(현재 단계)*; custom container runtime 기반 복원 경로 *(다음)*.
-2. **PhOS 동시 체크포인팅** — Copy-on-Write 데이터버퍼 체크포인트 후 제어 상태
-   체크포인트.
-3. **CRIUgpu 통합** — 대체 제어 상태 체크포인트 백엔드.
-
-복원 순서(예정): **Control State → GPU Data Buffer**, Restore Pod 어노테이션을
-custom CRI-O/runtime이 처리하는 방식으로 트리거.
+   컨트롤러 없음). ✅ **완료·검증**: VMM 소유 데이터 엔진(복사 + 물리해제 + 주소보존 remap),
+   cuda-checkpoint control, CRIU CPU-only, 비파괴적 resume.
+2. **tar → 새 컨테이너 복원** — 체크포인트 이미지를 재사용하려면 CRI-O 작업 필요;
+   순서 **Control State → GPU Data Buffer**. *(다음, 사용자 트리거)*
+3. **증분 체크포인팅** — shadow execution + dirty templates로 변경된 버퍼만 저장(tar 크기
+   축소). *(향후)*
 
 ---
 
