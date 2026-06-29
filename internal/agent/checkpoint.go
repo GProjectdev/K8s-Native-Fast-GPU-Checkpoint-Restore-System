@@ -164,7 +164,16 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 		klog.Errorf("resume after checkpoint failed (job may be suspended): %v", err)
 	}
 	if c.GCRInterception {
-		_ = c.Interceptor.Signal(t.PodUID, GCRSignalIdle)
+		// Remap GPU data buffers AFTER control state is resumed: recreate physical
+		// memory and map it back to the preserved virtual addresses, then copy the
+		// host-resident data back to the device.
+		if err := c.Interceptor.Signal(t.PodUID, GCRSignalRestore); err != nil {
+			klog.Errorf("signal GCR restore/remap failed: %v", err)
+		} else if !c.DryRun {
+			if err := c.Interceptor.WaitForAck(t.PodUID, 120*time.Second); err != nil {
+				klog.Errorf("GCR restore/remap did not ack: %v", err)
+			}
+		}
 	}
 	klog.Infof("step 5/5 done: workload resumed; checkpoint took %s", time.Since(start))
 

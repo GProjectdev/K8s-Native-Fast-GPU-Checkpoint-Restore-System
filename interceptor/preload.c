@@ -176,23 +176,25 @@ static void dump_intercepted_info(void) {
 
 static int gcr_vmm_enabled(void);
 static size_t gcr_owned_count(void);
-static void checkpoint_owned_roundtrip(void);
+static void checkpoint_freeze(void);
+static void restore_remap(void);
 
 static void *watcher(void *arg) {
     (void)arg;
     for (;;) {
-        if (read_signal() == GCR_CKPT) {
-            fprintf(stderr, "[gcr] checkpoint signal received\n");
-            fflush(stderr);
-            if (gcr_vmm_enabled() && gcr_owned_count() > 0) {
-                checkpoint_owned_roundtrip();   // GCR data engine round-trip
-            } else {
-                vmm_dump();                     // observe-only fallback
-            }
+        int sig = read_signal();
+        if (sig == GCR_CKPT) {
+            fprintf(stderr, "[gcr] checkpoint signal received\n"); fflush(stderr);
+            if (gcr_vmm_enabled() && gcr_owned_count() > 0) checkpoint_freeze();  // copy + free physical (keep VA)
+            else vmm_dump();
             dump_intercepted_info();
             write_signal(GCR_IDLE);
-            fprintf(stderr, "[gcr] checkpoint ACK sent\n");
-            fflush(stderr);
+            fprintf(stderr, "[gcr] checkpoint ACK sent\n"); fflush(stderr);
+        } else if (sig == GCR_RESTORE) {
+            fprintf(stderr, "[gcr] restore signal received\n"); fflush(stderr);
+            if (gcr_vmm_enabled() && gcr_owned_count() > 0) restore_remap();      // recreate + map same VA + H2D
+            write_signal(GCR_IDLE);
+            fprintf(stderr, "[gcr] restore ACK sent\n"); fflush(stderr);
         }
         usleep(50 * 1000);
     }
@@ -219,7 +221,7 @@ __attribute__((constructor)) static void gcr_init(void) {
 
 typedef struct { struct { int type; int id; } location; int flags; } gcr_access_desc_t;
 
-typedef struct { CUdeviceptr_t va; size_t padded; size_t req; CUmemHandle_t handle; gcr_mem_prop_t prop; int live; } gcr_owned_t;
+typedef struct { CUdeviceptr_t va; size_t padded; size_t req; CUmemHandle_t handle; gcr_mem_prop_t prop; int live; void *host_buf; int frozen; } gcr_owned_t;
 static gcr_owned_t g_owned[GCR_MAX_VMM]; static atomic_size_t g_owned_n = 0;
 static pthread_mutex_t g_owned_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -322,49 +324,62 @@ static int gcr_vmm_free(void *ptr) {
     return 0;
 }
 
-// STEP 3: GCR data-engine round-trip on checkpoint signal:
-//   D2H copy -> cuMemUnmap/cuMemRelease (free physical, keep VA) ->
-//   cuMemCreate/cuMemMap to the SAME VA -> H2D copy back.
-// Proves copy + physical-free + address-preserving remap + data integrity.
-static void checkpoint_owned_roundtrip(void) {
-    static int (*rt_setdev)(int) = NULL;
-    static int (*rt_sync)(void) = NULL;
-    static int (*rt_memcpy)(void *, const void *, size_t, int) = NULL;
-    if (!rt_setdev)  rt_setdev  = (int (*)(int))gcr_next("cudaSetDevice");
-    if (!rt_sync)    rt_sync    = (int (*)(void))gcr_next("cudaDeviceSynchronize");
-    if (!rt_memcpy)  rt_memcpy  = (int (*)(void *, const void *, size_t, int))gcr_next("cudaMemcpy");
-    resolve_vmm_real();
-    if (!rt_memcpy || !r_cuMemUnmap2 || !r_cuMemRelease2 || !r_cuMemCreate || !r_cuMemMap || !r_cuMemSetAccess) {
-        fprintf(stderr, "[gcr][engine] missing fns; abort round-trip\n"); fflush(stderr); return;
-    }
+// runtime fns for D2H/H2D copies (resolved lazily on the watcher thread)
+static int (*rt_setdev)(int) = NULL;
+static int (*rt_sync)(void) = NULL;
+static int (*rt_memcpy)(void *, const void *, size_t, int) = NULL;
+static void resolve_rt_copy(void) {
+    if (!rt_setdev) rt_setdev = (int (*)(int))gcr_next("cudaSetDevice");
+    if (!rt_sync)   rt_sync   = (int (*)(void))gcr_next("cudaDeviceSynchronize");
+    if (!rt_memcpy) rt_memcpy = (int (*)(void *, const void *, size_t, int))gcr_next("cudaMemcpy");
+}
+
+// STEP 4a — checkpoint freeze: copy each owned buffer D2H into process memory,
+// then free ONLY the physical memory (cuMemUnmap+cuMemRelease), KEEPING the VA.
+// Leaves host_buf set + frozen=1 so CRIU captures the data and restore can remap.
+static void checkpoint_freeze(void) {
+    resolve_rt_copy(); resolve_vmm_real();
+    if (!rt_memcpy || !r_cuMemUnmap2 || !r_cuMemRelease2) { fprintf(stderr, "[gcr][engine] freeze: missing fns\n"); fflush(stderr); return; }
     if (rt_setdev) rt_setdev(0);
     if (rt_sync)   rt_sync();
     size_t n = atomic_load(&g_owned_n), done = 0, bytes = 0, fail = 0;
     for (size_t i = 0; i < n; i++) {
-        if (!g_owned[i].live) continue;
+        if (!g_owned[i].live || g_owned[i].frozen) continue;
         gcr_owned_t *o = &g_owned[i];
         void *hb = malloc(o->req);
         if (!hb) { fail++; continue; }
         if (rt_memcpy(hb, (const void *)(uintptr_t)o->va, o->req, 2 /*D2H*/) != 0) { free(hb); fail++; continue; }
-        // free physical only; KEEP the VA reservation
         r_cuMemUnmap2(o->va, o->padded);
         r_cuMemRelease2(o->handle);
-        // recreate physical + map to the SAME virtual address
+        o->host_buf = hb; o->frozen = 1;
+        done++; bytes += o->req;
+    }
+    fprintf(stderr, "[gcr][engine] freeze: %zu segs, %zu bytes copied to host, physical released (VA kept); %zu failed\n", done, bytes, fail);
+    fflush(stderr);
+}
+
+// STEP 4b — restore remap: recreate physical, map to the SAME VA, copy host->device.
+static void restore_remap(void) {
+    resolve_rt_copy(); resolve_vmm_real();
+    if (!rt_memcpy || !r_cuMemCreate || !r_cuMemMap || !r_cuMemSetAccess) { fprintf(stderr, "[gcr][engine] remap: missing fns\n"); fflush(stderr); return; }
+    if (rt_setdev) rt_setdev(0);
+    size_t n = atomic_load(&g_owned_n), done = 0, fail = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!g_owned[i].frozen) continue;
+        gcr_owned_t *o = &g_owned[i];
         CUmemHandle_t nh = 0;
-        if (r_cuMemCreate(&nh, o->padded, &o->prop, 0) != 0) { fprintf(stderr, "[gcr][engine] recreate fail va=0x%llx\n", (unsigned long long)o->va); free(hb); fail++; continue; }
-        if (r_cuMemMap(o->va, o->padded, 0, nh, 0) != 0) { fprintf(stderr, "[gcr][engine] remap fail va=0x%llx\n", (unsigned long long)o->va); r_cuMemRelease2(nh); free(hb); fail++; continue; }
+        if (r_cuMemCreate(&nh, o->padded, &o->prop, 0) != 0) { fprintf(stderr, "[gcr][engine] remap recreate fail va=0x%llx\n", (unsigned long long)o->va); fail++; continue; }
+        if (r_cuMemMap(o->va, o->padded, 0, nh, 0) != 0) { fprintf(stderr, "[gcr][engine] remap map fail va=0x%llx\n", (unsigned long long)o->va); r_cuMemRelease2(nh); fail++; continue; }
         gcr_access_desc_t d; memset(&d, 0, sizeof(d));
         d.location.type = CU_MEM_LOCATION_TYPE_DEVICE; d.location.id = o->prop.location.id;
         d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         r_cuMemSetAccess(o->va, o->padded, &d, 1);
-        rt_memcpy((void *)(uintptr_t)o->va, hb, o->req, 1 /*H2D*/);
-        free(hb);
-        o->handle = nh;
-        done++; bytes += o->req;
+        if (o->host_buf) { rt_memcpy((void *)(uintptr_t)o->va, o->host_buf, o->req, 1 /*H2D*/); free(o->host_buf); o->host_buf = NULL; }
+        o->handle = nh; o->frozen = 0;
+        done++;
     }
     if (rt_sync) rt_sync();
-    fprintf(stderr, "[gcr][engine] round-trip done: %zu segs, %zu bytes, %zu failed "
-                    "(D2H -> unmap/release -> recreate/map same VA -> H2D)\n", done, bytes, fail);
+    fprintf(stderr, "[gcr][engine] remap: %zu segs restored to same VA + H2D; %zu failed\n", done, fail);
     fflush(stderr);
 }
 
