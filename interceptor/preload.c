@@ -270,19 +270,64 @@ CUresult_t cuMemAddressFree(CUdeviceptr_t ptr, size_t size) {
 }
 
 
-// ---- dlsym interceptor: redirect PyTorch's libcuda VMM lookups to our wrappers.
-// PyTorch resolves cuMem* via dlsym(libcuda_handle, "cuMemCreate"), which bypasses
-// normal LD_PRELOAD symbol interposition. We intercept dlsym so those lookups
-// return OUR wrappers; everything else passes through to the real dlsym.
+// ---- resolution diagnostics + redirect helpers --------------------------
+static void gcr_log_sym(const char *who, const char *symbol) {
+    if (symbol && symbol[0] == 'c' && symbol[1] == 'u') {
+        fprintf(stderr, "[gcr][resolve] %s(%s)\n", who, symbol);
+        fflush(stderr);
+    }
+}
+// Overwrite *pfn with our wrapper for the VMM targets. Returns 1 if redirected.
+static int gcr_redirect(const char *symbol, void **pfn) {
+    if (!symbol || !pfn) return 0;
+    void *w = NULL;
+    if      (!strcmp(symbol, "cuMemCreate"))         w = (void *)cuMemCreate;
+    else if (!strcmp(symbol, "cuMemMap"))            w = (void *)cuMemMap;
+    else if (!strcmp(symbol, "cuMemUnmap"))          w = (void *)cuMemUnmap;
+    else if (!strcmp(symbol, "cuMemRelease"))        w = (void *)cuMemRelease;
+    else if (!strcmp(symbol, "cuMemAddressReserve")) w = (void *)cuMemAddressReserve;
+    else if (!strcmp(symbol, "cuMemAddressFree"))    w = (void *)cuMemAddressFree;
+    if (w) { *pfn = w; fprintf(stderr, "[gcr][resolve] redirect %s -> wrapper\n", symbol); fflush(stderr); return 1; }
+    return 0;
+}
+
+// ---- cuGetProcAddress hooks (CUDA driver function-pointer table) ---------
+// CUresult cuGetProcAddress(const char*, void**, int, cuuint64_t)
+static CUresult_t (*real_cuGetProcAddress)(const char *, void **, int, unsigned long long) = NULL;
+CUresult_t cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, unsigned long long flags) {
+    if (!real_cuGetProcAddress) real_cuGetProcAddress = (CUresult_t (*)(const char *, void **, int, unsigned long long))gcr_next("cuGetProcAddress");
+    CUresult_t rc = real_cuGetProcAddress ? real_cuGetProcAddress(symbol, pfn, cudaVersion, flags) : 0;
+    gcr_log_sym("cuGetProcAddress", symbol);
+    if (rc == 0) gcr_redirect(symbol, pfn);
+    return rc;
+}
+// CUresult cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*)
+static CUresult_t (*real_cuGetProcAddress_v2)(const char *, void **, int, unsigned long long, void *) = NULL;
+CUresult_t cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion, unsigned long long flags, void *status) {
+    if (!real_cuGetProcAddress_v2) real_cuGetProcAddress_v2 = (CUresult_t (*)(const char *, void **, int, unsigned long long, void *))gcr_next("cuGetProcAddress_v2");
+    CUresult_t rc = real_cuGetProcAddress_v2 ? real_cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, status) : 0;
+    gcr_log_sym("cuGetProcAddress_v2", symbol);
+    if (rc == 0) gcr_redirect(symbol, pfn);
+    return rc;
+}
+
+// ---- dlsym interceptor ---------------------------------------------------
+// PyTorch resolves cuMem*/cuGetProcAddress via dlsym(libcuda_handle, name), which
+// bypasses normal LD_PRELOAD interposition. We intercept dlsym so those lookups
+// return OUR wrappers; everything else passes through to the real dlsym. We also
+// log every "cu*" lookup to reveal how the app resolves the driver API.
 void *dlsym(void *handle, const char *symbol) {
     ensure_real_dlsym();
+    gcr_log_sym("dlsym", symbol);
     if (symbol) {
-        if (!strcmp(symbol, "cuMemCreate"))         { return (void *)cuMemCreate; }
-        if (!strcmp(symbol, "cuMemMap"))            { return (void *)cuMemMap; }
-        if (!strcmp(symbol, "cuMemUnmap"))          { return (void *)cuMemUnmap; }
-        if (!strcmp(symbol, "cuMemRelease"))        { return (void *)cuMemRelease; }
-        if (!strcmp(symbol, "cuMemAddressReserve")) { return (void *)cuMemAddressReserve; }
-        if (!strcmp(symbol, "cuMemAddressFree"))    { return (void *)cuMemAddressFree; }
+        if (!strcmp(symbol, "cuGetProcAddress"))    return (void *)cuGetProcAddress;
+        if (!strcmp(symbol, "cuGetProcAddress_v2")) return (void *)cuGetProcAddress_v2;
+        if (!strcmp(symbol, "cuMemCreate"))         return (void *)cuMemCreate;
+        if (!strcmp(symbol, "cuMemMap"))            return (void *)cuMemMap;
+        if (!strcmp(symbol, "cuMemUnmap"))          return (void *)cuMemUnmap;
+        if (!strcmp(symbol, "cuMemRelease"))        return (void *)cuMemRelease;
+        if (!strcmp(symbol, "cuMemAddressReserve")) return (void *)cuMemAddressReserve;
+        if (!strcmp(symbol, "cuMemAddressFree"))    return (void *)cuMemAddressFree;
     }
     return real_dlsym ? real_dlsym(handle, symbol) : NULL;
 }
