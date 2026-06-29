@@ -174,13 +174,21 @@ static void dump_intercepted_info(void) {
     fclose(f);
 }
 
+static int gcr_vmm_enabled(void);
+static size_t gcr_owned_count(void);
+static void checkpoint_owned_roundtrip(void);
+
 static void *watcher(void *arg) {
     (void)arg;
     for (;;) {
         if (read_signal() == GCR_CKPT) {
-            fprintf(stderr, "[gcr] checkpoint signal received (STEP 1: observe VMM, no copy)\n");
+            fprintf(stderr, "[gcr] checkpoint signal received\n");
             fflush(stderr);
-            vmm_dump();              // <-- the new Level-1 observation
+            if (gcr_vmm_enabled() && gcr_owned_count() > 0) {
+                checkpoint_owned_roundtrip();   // GCR data engine round-trip
+            } else {
+                vmm_dump();                     // observe-only fallback
+            }
             dump_intercepted_info();
             write_signal(GCR_IDLE);
             fprintf(stderr, "[gcr] checkpoint ACK sent\n");
@@ -226,6 +234,7 @@ static CUresult_t (*r_cuMemAddressFree2)(CUdeviceptr_t, size_t) = NULL;
 static int        (*r_cudaGetDevice)(int *) = NULL;
 
 static int gcr_vmm_enabled(void) { const char *e = getenv("GCR_VMM_ALLOC"); return e && e[0] == '1'; }
+static size_t gcr_owned_count(void) { return atomic_load(&g_owned_n); }
 
 // Resolve a DRIVER (libcuda) symbol. libcuda is dlopen'd RTLD_LOCAL by cudart, so
 // it is NOT in the global scope reachable via RTLD_NEXT — we must open a handle to
@@ -311,6 +320,52 @@ static int gcr_vmm_free(void *ptr) {
     fprintf(stderr, "[gcr][vmm-free] va=0x%llx\n", (unsigned long long)va);
     fflush(stderr);
     return 0;
+}
+
+// STEP 3: GCR data-engine round-trip on checkpoint signal:
+//   D2H copy -> cuMemUnmap/cuMemRelease (free physical, keep VA) ->
+//   cuMemCreate/cuMemMap to the SAME VA -> H2D copy back.
+// Proves copy + physical-free + address-preserving remap + data integrity.
+static void checkpoint_owned_roundtrip(void) {
+    static int (*rt_setdev)(int) = NULL;
+    static int (*rt_sync)(void) = NULL;
+    static int (*rt_memcpy)(void *, const void *, size_t, int) = NULL;
+    if (!rt_setdev)  rt_setdev  = (int (*)(int))gcr_next("cudaSetDevice");
+    if (!rt_sync)    rt_sync    = (int (*)(void))gcr_next("cudaDeviceSynchronize");
+    if (!rt_memcpy)  rt_memcpy  = (int (*)(void *, const void *, size_t, int))gcr_next("cudaMemcpy");
+    resolve_vmm_real();
+    if (!rt_memcpy || !r_cuMemUnmap2 || !r_cuMemRelease2 || !r_cuMemCreate || !r_cuMemMap || !r_cuMemSetAccess) {
+        fprintf(stderr, "[gcr][engine] missing fns; abort round-trip\n"); fflush(stderr); return;
+    }
+    if (rt_setdev) rt_setdev(0);
+    if (rt_sync)   rt_sync();
+    size_t n = atomic_load(&g_owned_n), done = 0, bytes = 0, fail = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!g_owned[i].live) continue;
+        gcr_owned_t *o = &g_owned[i];
+        void *hb = malloc(o->req);
+        if (!hb) { fail++; continue; }
+        if (rt_memcpy(hb, (const void *)(uintptr_t)o->va, o->req, 2 /*D2H*/) != 0) { free(hb); fail++; continue; }
+        // free physical only; KEEP the VA reservation
+        r_cuMemUnmap2(o->va, o->padded);
+        r_cuMemRelease2(o->handle);
+        // recreate physical + map to the SAME virtual address
+        CUmemHandle_t nh = 0;
+        if (r_cuMemCreate(&nh, o->padded, &o->prop, 0) != 0) { fprintf(stderr, "[gcr][engine] recreate fail va=0x%llx\n", (unsigned long long)o->va); free(hb); fail++; continue; }
+        if (r_cuMemMap(o->va, o->padded, 0, nh, 0) != 0) { fprintf(stderr, "[gcr][engine] remap fail va=0x%llx\n", (unsigned long long)o->va); r_cuMemRelease2(nh); free(hb); fail++; continue; }
+        gcr_access_desc_t d; memset(&d, 0, sizeof(d));
+        d.location.type = CU_MEM_LOCATION_TYPE_DEVICE; d.location.id = o->prop.location.id;
+        d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        r_cuMemSetAccess(o->va, o->padded, &d, 1);
+        rt_memcpy((void *)(uintptr_t)o->va, hb, o->req, 1 /*H2D*/);
+        free(hb);
+        o->handle = nh;
+        done++; bytes += o->req;
+    }
+    if (rt_sync) rt_sync();
+    fprintf(stderr, "[gcr][engine] round-trip done: %zu segs, %zu bytes, %zu failed "
+                    "(D2H -> unmap/release -> recreate/map same VA -> H2D)\n", done, bytes, fail);
+    fflush(stderr);
 }
 
 // ---- legacy intercepted CUDA memory APIs --------------------------------
