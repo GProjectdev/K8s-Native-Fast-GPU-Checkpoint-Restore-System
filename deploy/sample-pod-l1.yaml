@@ -32,6 +32,9 @@ spec:
         # uses the DEFAULT allocator (plain cudaMalloc) and we provide the VMM
         # layer underneath. No expandable_segments dependency. (Step 1 here only
         # verifies our cudaMalloc hook actually catches PyTorch's allocations.)
+        # Step 2: serve cudaMalloc from our own VMM mapping (framework-agnostic).
+        - name: GCR_VMM_ALLOC
+          value: "1"
         - name: LD_PRELOAD
           value: /opt/gpu-cr/libgcr-interceptor.so
         - name: GCR_HOME

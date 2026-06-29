@@ -201,9 +201,102 @@ __attribute__((constructor)) static void gcr_init(void) {
     fflush(stderr);
 }
 
+// ---- GCR-owned VMM allocator (Step 2: back cudaMalloc with VMM) ----------
+// When GCR_VMM_ALLOC=1, cudaMalloc is served from our own VMM mapping so that at
+// checkpoint we can copy D2H, free ONLY the physical memory, and keep the virtual
+// address (cuMemUnmap/cuMemRelease) — then remap to the same VA on resume.
+#define CU_MEM_ALLOCATION_TYPE_PINNED      1
+#define CU_MEM_LOCATION_TYPE_DEVICE        1
+#define CU_MEM_ACCESS_FLAGS_PROT_READWRITE 3
+
+typedef struct { struct { int type; int id; } location; int flags; } gcr_access_desc_t;
+
+typedef struct { CUdeviceptr_t va; size_t padded; size_t req; CUmemHandle_t handle; gcr_mem_prop_t prop; int live; } gcr_owned_t;
+static gcr_owned_t g_owned[GCR_MAX_VMM]; static atomic_size_t g_owned_n = 0;
+static pthread_mutex_t g_owned_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static CUresult_t (*r_cuMemGetAllocationGranularity)(size_t *, const void *, int) = NULL;
+static CUresult_t (*r_cuMemAddressReserve)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long) = NULL;
+static CUresult_t (*r_cuMemCreate)(CUmemHandle_t *, size_t, const void *, unsigned long long) = NULL;
+static CUresult_t (*r_cuMemMap)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long) = NULL;
+static CUresult_t (*r_cuMemSetAccess)(CUdeviceptr_t, size_t, const void *, size_t) = NULL;
+static CUresult_t (*r_cuMemUnmap2)(CUdeviceptr_t, size_t) = NULL;
+static CUresult_t (*r_cuMemRelease2)(CUmemHandle_t) = NULL;
+static CUresult_t (*r_cuMemAddressFree2)(CUdeviceptr_t, size_t) = NULL;
+static int        (*r_cudaGetDevice)(int *) = NULL;
+
+static int gcr_vmm_enabled(void) { const char *e = getenv("GCR_VMM_ALLOC"); return e && e[0] == '1'; }
+
+static void resolve_vmm_real(void) {
+    if (!r_cuMemGetAllocationGranularity) r_cuMemGetAllocationGranularity = (CUresult_t (*)(size_t *, const void *, int))gcr_next("cuMemGetAllocationGranularity");
+    if (!r_cuMemAddressReserve) r_cuMemAddressReserve = (CUresult_t (*)(CUdeviceptr_t *, size_t, size_t, CUdeviceptr_t, unsigned long long))gcr_next("cuMemAddressReserve");
+    if (!r_cuMemCreate)  r_cuMemCreate  = (CUresult_t (*)(CUmemHandle_t *, size_t, const void *, unsigned long long))gcr_next("cuMemCreate");
+    if (!r_cuMemMap)     r_cuMemMap     = (CUresult_t (*)(CUdeviceptr_t, size_t, size_t, CUmemHandle_t, unsigned long long))gcr_next("cuMemMap");
+    if (!r_cuMemSetAccess) r_cuMemSetAccess = (CUresult_t (*)(CUdeviceptr_t, size_t, const void *, size_t))gcr_next("cuMemSetAccess");
+    if (!r_cuMemUnmap2)  r_cuMemUnmap2  = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_next("cuMemUnmap");
+    if (!r_cuMemRelease2) r_cuMemRelease2 = (CUresult_t (*)(CUmemHandle_t))gcr_next("cuMemRelease");
+    if (!r_cuMemAddressFree2) r_cuMemAddressFree2 = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_next("cuMemAddressFree");
+    if (!r_cudaGetDevice) r_cudaGetDevice = (int (*)(int *))gcr_next("cudaGetDevice");
+}
+
+// Returns 0 on success (and sets *devPtr), -1 to fall back to the real cudaMalloc.
+static int gcr_vmm_alloc(void **devPtr, size_t size) {
+    resolve_vmm_real();
+    if (!r_cuMemCreate || !r_cuMemMap || !r_cuMemAddressReserve || !r_cuMemSetAccess || !r_cuMemGetAllocationGranularity)
+        return -1;
+    int dev = 0; if (r_cudaGetDevice) r_cudaGetDevice(&dev);
+    gcr_mem_prop_t prop; memset(&prop, 0, sizeof(prop));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    size_t gran = 0;
+    if (r_cuMemGetAllocationGranularity(&gran, &prop, 0) != 0 || gran == 0) gran = (2UL << 20);
+    size_t padded = ((size + gran - 1) / gran) * gran;
+    if (padded == 0) padded = gran;
+    CUmemHandle_t handle = 0;
+    if (r_cuMemCreate(&handle, padded, &prop, 0) != 0) return -1;
+    CUdeviceptr_t va = 0;
+    if (r_cuMemAddressReserve(&va, padded, 0, 0, 0) != 0) { r_cuMemRelease2(handle); return -1; }
+    if (r_cuMemMap(va, padded, 0, handle, 0) != 0) { r_cuMemAddressFree2(va, padded); r_cuMemRelease2(handle); return -1; }
+    gcr_access_desc_t desc; memset(&desc, 0, sizeof(desc));
+    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE; desc.location.id = dev;
+    desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (r_cuMemSetAccess(va, padded, &desc, 1) != 0) { r_cuMemUnmap2(va, padded); r_cuMemAddressFree2(va, padded); r_cuMemRelease2(handle); return -1; }
+    pthread_mutex_lock(&g_owned_lock);
+    size_t n = atomic_load(&g_owned_n);
+    if (n < GCR_MAX_VMM) { g_owned[n].va = va; g_owned[n].padded = padded; g_owned[n].req = size; g_owned[n].handle = handle; g_owned[n].prop = prop; g_owned[n].live = 1; atomic_store(&g_owned_n, n + 1); }
+    pthread_mutex_unlock(&g_owned_lock);
+    *devPtr = (void *)(uintptr_t)va;
+    fprintf(stderr, "[gcr][vmm-alloc] req=%zu padded=%zu va=0x%llx handle=%llu\n", size, padded, (unsigned long long)va, (unsigned long long)handle);
+    fflush(stderr);
+    return 0;
+}
+
+// Returns 0 if ptr was a GCR-owned VMM allocation (and freed it), -1 otherwise.
+static int gcr_vmm_free(void *ptr) {
+    CUdeviceptr_t va = (CUdeviceptr_t)(uintptr_t)ptr;
+    pthread_mutex_lock(&g_owned_lock);
+    size_t n = atomic_load(&g_owned_n); int found = -1;
+    for (size_t i = 0; i < n; i++) if (g_owned[i].live && g_owned[i].va == va) { found = (int)i; break; }
+    pthread_mutex_unlock(&g_owned_lock);
+    if (found < 0) return -1;
+    gcr_owned_t *o = &g_owned[found];
+    if (r_cuMemUnmap2) r_cuMemUnmap2(o->va, o->padded);
+    if (r_cuMemRelease2) r_cuMemRelease2(o->handle);
+    if (r_cuMemAddressFree2) r_cuMemAddressFree2(o->va, o->padded);
+    o->live = 0;
+    fprintf(stderr, "[gcr][vmm-free] va=0x%llx\n", (unsigned long long)va);
+    fflush(stderr);
+    return 0;
+}
+
 // ---- legacy intercepted CUDA memory APIs --------------------------------
 static int (*real_cudaMalloc)(void **, size_t) = NULL;
 int cudaMalloc(void **devPtr, size_t size) {
+    if (gcr_vmm_enabled() && devPtr && size) {
+        if (gcr_vmm_alloc(devPtr, size) == 0) return 0;  // cudaSuccess, VMM-backed
+        fprintf(stderr, "[gcr][vmm-alloc] FAILED for size=%zu, falling back to real cudaMalloc\n", size); fflush(stderr);
+    }
     if (!real_cudaMalloc) real_cudaMalloc = (int (*)(void **, size_t))gcr_next("cudaMalloc");
     int rc = real_cudaMalloc(devPtr, size);
     if (rc == 0 && devPtr) { reg_add(*devPtr, size); fprintf(stderr, "[gcr][rt] cudaMalloc size=%zu ptr=%p\n", size, *devPtr); fflush(stderr); }
@@ -211,8 +304,8 @@ int cudaMalloc(void **devPtr, size_t size) {
 }
 static int (*real_cudaFree)(void *) = NULL;
 int cudaFree(void *devPtr) {
+    if (devPtr && gcr_vmm_free(devPtr) == 0) return 0;  // was a GCR-owned VMM allocation
     if (!real_cudaFree) real_cudaFree = (int (*)(void *))gcr_next("cudaFree");
-    if (devPtr) { fprintf(stderr, "[gcr][rt] cudaFree ptr=%p\n", devPtr); fflush(stderr); }
     reg_del(devPtr);
     return real_cudaFree(devPtr);
 }
