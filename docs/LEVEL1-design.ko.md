@@ -109,3 +109,23 @@ VA를 한 번도 해제하지 않았으므로 같은 주소 remap이 성립 → 
 3. unmap/release 추가 → device 메모리가 실제로 빠지는지(nvidia-smi) 확인
 4. restore 핸들러: cuMemCreate+Map+H2D → 체크섬 정합성 확인
 5. 에이전트 step5 remap 신호 연동 → end-to-end
+
+---
+
+## 갱신: GCR 방식 = 인터셉터가 VMM 할당을 직접 소유 (framework-agnostic)
+
+expandable_segments(PyTorch) 의존을 없애기 위해, **인터셉터가 cudaMalloc/cuMemAlloc을 가로채
+내부적으로 VMM(`cuMemAddressReserve`+`cuMemCreate`+`cuMemMap`)으로 백킹**한다. 앱은 평범한
+cudaMalloc을 부르지만 메모리는 우리가 VA/물리를 분리 가능한 형태로 제공 → 어떤 프레임워크든 동작.
+
+- 장점: PyTorch/expandable_segments 의존 제거.
+- 비용: 작은 VMM 할당기 필요. granularity(≈2MB) 낭비는 PyTorch 캐싱 allocator(큰 블록)에선 작음.
+  작은 할당 많은 앱은 후속에 sub-allocation 풀로 보강.
+
+구현 순서(개정):
+1. **(검증)** cudaMalloc/cudaMallocAsync 후킹이 PyTorch 기본 allocator를 실제로 잡는지 로그로 확인
+   (expandable_segments OFF). ← 지금 단계
+2. cudaMalloc 후킹을 VMM 백킹으로 교체(reserve+create+map+setaccess), 레지스트리에 {va,size,handle,prop} 기록
+3. 체크포인트: D2H 복사 + cuMemUnmap/cuMemRelease(VA 보존)
+4. 복원: cuMemCreate+cuMemMap(같은 VA)+H2D
+5. 에이전트 step5 remap 신호 연동

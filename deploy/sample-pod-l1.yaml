@@ -28,10 +28,10 @@ spec:
               print("checksum=%.6f %s" % (cur, "OK" if abs(cur-base) < 1.0 else "MISMATCH!"), flush=True)
               time.sleep(15)
       env:
-        # Make PyTorch use the CUDA VMM API (cuMemCreate/cuMemMap) so the
-        # interceptor can do GCR-style copy + physical free + remap.
-        - name: PYTORCH_CUDA_ALLOC_CONF
-          value: expandable_segments:True
+        # GCR's way: the interceptor OWNS the VMM-backed allocation, so the app
+        # uses the DEFAULT allocator (plain cudaMalloc) and we provide the VMM
+        # layer underneath. No expandable_segments dependency. (Step 1 here only
+        # verifies our cudaMalloc hook actually catches PyTorch's allocations.)
         - name: LD_PRELOAD
           value: /opt/gpu-cr/libgcr-interceptor.so
         - name: GCR_HOME

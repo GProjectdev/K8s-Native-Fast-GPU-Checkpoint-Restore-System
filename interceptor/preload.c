@@ -206,12 +206,13 @@ static int (*real_cudaMalloc)(void **, size_t) = NULL;
 int cudaMalloc(void **devPtr, size_t size) {
     if (!real_cudaMalloc) real_cudaMalloc = (int (*)(void **, size_t))gcr_next("cudaMalloc");
     int rc = real_cudaMalloc(devPtr, size);
-    if (rc == 0 && devPtr) reg_add(*devPtr, size);
+    if (rc == 0 && devPtr) { reg_add(*devPtr, size); fprintf(stderr, "[gcr][rt] cudaMalloc size=%zu ptr=%p\n", size, *devPtr); fflush(stderr); }
     return rc;
 }
 static int (*real_cudaFree)(void *) = NULL;
 int cudaFree(void *devPtr) {
     if (!real_cudaFree) real_cudaFree = (int (*)(void *))gcr_next("cudaFree");
+    if (devPtr) { fprintf(stderr, "[gcr][rt] cudaFree ptr=%p\n", devPtr); fflush(stderr); }
     reg_del(devPtr);
     return real_cudaFree(devPtr);
 }
@@ -227,6 +228,21 @@ int cuMemFree_v2(unsigned long long dptr) {
     if (!real_cuMemFree) real_cuMemFree = (int (*)(unsigned long long))gcr_next("cuMemFree_v2");
     reg_del((void *)(uintptr_t)dptr);
     return real_cuMemFree(dptr);
+}
+
+// stream-ordered allocations (PyTorch may use these instead of cudaMalloc)
+static int (*real_cudaMallocAsync)(void **, size_t, void *) = NULL;
+int cudaMallocAsync(void **devPtr, size_t size, void *stream) {
+    if (!real_cudaMallocAsync) real_cudaMallocAsync = (int (*)(void **, size_t, void *))gcr_next("cudaMallocAsync");
+    int rc = real_cudaMallocAsync(devPtr, size, stream);
+    if (rc == 0 && devPtr) { reg_add(*devPtr, size); fprintf(stderr, "[gcr][rt] cudaMallocAsync size=%zu ptr=%p\n", size, *devPtr); fflush(stderr); }
+    return rc;
+}
+static int (*real_cudaFreeAsync)(void *, void *) = NULL;
+int cudaFreeAsync(void *devPtr, void *stream) {
+    if (!real_cudaFreeAsync) real_cudaFreeAsync = (int (*)(void *, void *))gcr_next("cudaFreeAsync");
+    reg_del(devPtr);
+    return real_cudaFreeAsync(devPtr, stream);
 }
 
 // ---- VMM intercepted APIs (Level 1, step 1: observe) --------------------
@@ -328,6 +344,10 @@ void *dlsym(void *handle, const char *symbol) {
         if (!strcmp(symbol, "cuMemRelease"))        return (void *)cuMemRelease;
         if (!strcmp(symbol, "cuMemAddressReserve")) return (void *)cuMemAddressReserve;
         if (!strcmp(symbol, "cuMemAddressFree"))    return (void *)cuMemAddressFree;
+        if (!strcmp(symbol, "cudaMalloc"))          return (void *)cudaMalloc;
+        if (!strcmp(symbol, "cudaFree"))            return (void *)cudaFree;
+        if (!strcmp(symbol, "cudaMallocAsync"))     return (void *)cudaMallocAsync;
+        if (!strcmp(symbol, "cudaFreeAsync"))       return (void *)cudaFreeAsync;
     }
     return real_dlsym ? real_dlsym(handle, symbol) : NULL;
 }
