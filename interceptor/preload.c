@@ -27,6 +27,7 @@
 #define GCR_IDLE 0
 #define GCR_CKPT 1
 #define GCR_RESTORE 2
+#define GCR_GATING 3   // interceptor -> orchestrator: gate is up, safe to `cuda-checkpoint unlock`
 
 // ---- real dlsym (to call through our own dlsym override without recursion) ----
 static void *(*real_dlsym)(void *, const char *) = NULL;
@@ -174,6 +175,33 @@ static void dump_intercepted_info(void) {
     fclose(f);
 }
 
+// ---- restore gate --------------------------------------------------------
+// After a cross-container restore, the app process is resumed by `cuda-checkpoint
+// unlock` while the interceptor still has to remap the GPU data buffers (recreate
+// physical memory at the preserved VA + H2D). If the app runs a kernel before the
+// remap finishes it touches an UNMAPPED virtual address and dies with
+// CUDA_ERROR_INVALID_ARGUMENT / NO_DEVICE. We gate the app's kernel launches until
+// restore_remap() completes. gcr_gate_wait() is on the launch hot path but is a
+// single atomic load when the gate is open.
+static atomic_int g_gate = 0;                       // 1 = app kernel launches blocked
+static pthread_mutex_t g_gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_gate_cv   = PTHREAD_COND_INITIALIZER;
+static __thread int    g_in_remap  = 0;             // the remap thread must never gate itself
+
+static void gcr_gate_set(int on) {
+    pthread_mutex_lock(&g_gate_lock);
+    atomic_store(&g_gate, on ? 1 : 0);
+    if (!on) pthread_cond_broadcast(&g_gate_cv);
+    pthread_mutex_unlock(&g_gate_lock);
+}
+static void gcr_gate_wait(void) {
+    if (g_in_remap) return;                         // remap thread's own CUDA calls pass through
+    if (!atomic_load(&g_gate)) return;              // fast path
+    pthread_mutex_lock(&g_gate_lock);
+    while (atomic_load(&g_gate)) pthread_cond_wait(&g_gate_cv, &g_gate_lock);
+    pthread_mutex_unlock(&g_gate_lock);
+}
+
 static int gcr_vmm_enabled(void);
 static size_t gcr_owned_count(void);
 static void checkpoint_freeze(void);
@@ -192,8 +220,14 @@ static void *watcher(void *arg) {
             fprintf(stderr, "[gcr] checkpoint ACK sent\n"); fflush(stderr);
         } else if (sig == GCR_RESTORE) {
             fprintf(stderr, "[gcr] restore signal received\n"); fflush(stderr);
-            if (gcr_vmm_enabled() && gcr_owned_count() > 0) restore_remap();      // recreate + map same VA + H2D
-            write_signal(GCR_IDLE);
+            if (gcr_vmm_enabled() && gcr_owned_count() > 0) {
+                gcr_gate_set(1);            // (1) block app kernel launches
+                write_signal(GCR_GATING);  // (2) gate is up -> orchestrator may `cuda-checkpoint unlock`
+                restore_remap();           // (3) recreate physical + map same VA + H2D
+                                           //     (blocks under 'locked' until the orchestrator unlocks)
+                gcr_gate_set(0);           // (4) data valid -> release app kernel launches
+            }
+            write_signal(GCR_IDLE);        // (5) done
             fprintf(stderr, "[gcr] restore ACK sent\n"); fflush(stderr);
         }
         usleep(50 * 1000);
@@ -360,6 +394,7 @@ static void checkpoint_freeze(void) {
 
 // STEP 4b — restore remap: recreate physical, map to the SAME VA, copy host->device.
 static void restore_remap(void) {
+    g_in_remap = 1;
     resolve_rt_copy(); resolve_vmm_real();
     if (!rt_memcpy || !r_cuMemCreate || !r_cuMemMap || !r_cuMemSetAccess) { fprintf(stderr, "[gcr][engine] remap: missing fns\n"); fflush(stderr); return; }
     if (rt_setdev) rt_setdev(0);
@@ -381,6 +416,7 @@ static void restore_remap(void) {
     if (rt_sync) rt_sync();
     fprintf(stderr, "[gcr][engine] remap: %zu segs restored to same VA + H2D; %zu failed\n", done, fail);
     fflush(stderr);
+    g_in_remap = 0;
 }
 
 // ---- legacy intercepted CUDA memory APIs --------------------------------
@@ -469,4 +505,31 @@ static CUresult_t (*real_cuMemAddressFree)(CUdeviceptr_t, size_t) = NULL;
 CUresult_t cuMemAddressFree(CUdeviceptr_t ptr, size_t size) {
     if (!real_cuMemAddressFree) real_cuMemAddressFree = (CUresult_t (*)(CUdeviceptr_t, size_t))gcr_next("cuMemAddressFree");
     return real_cuMemAddressFree(ptr, size);
+}
+
+// ---- kernel-launch hooks: gate app compute during restore remap ----------
+// The app must not launch a kernel that reads the frozen data until restore_remap
+// has re-mapped it. We interpose the driver and runtime launch entrypoints and
+// block on the restore gate first (a no-op when the gate is open).
+typedef struct { unsigned int x, y, z; } gcr_dim3;
+
+static CUresult_t (*real_cuLaunchKernel)(void *, unsigned, unsigned, unsigned,
+                                         unsigned, unsigned, unsigned, unsigned,
+                                         void *, void **, void **) = NULL;
+CUresult_t cuLaunchKernel(void *f, unsigned gx, unsigned gy, unsigned gz,
+                          unsigned bx, unsigned by, unsigned bz,
+                          unsigned shmem, void *stream, void **kparams, void **extra) {
+    gcr_gate_wait();
+    if (!real_cuLaunchKernel) {
+        real_cuLaunchKernel = (CUresult_t (*)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **, void **))gcr_cuda_sym("cuLaunchKernel");
+        if (!real_cuLaunchKernel) real_cuLaunchKernel = (CUresult_t (*)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **, void **))gcr_next("cuLaunchKernel");
+    }
+    return real_cuLaunchKernel(f, gx, gy, gz, bx, by, bz, shmem, stream, kparams, extra);
+}
+
+static int (*real_cudaLaunchKernel)(const void *, gcr_dim3, gcr_dim3, void **, size_t, void *) = NULL;
+int cudaLaunchKernel(const void *func, gcr_dim3 gridDim, gcr_dim3 blockDim, void **args, size_t sharedMem, void *stream) {
+    gcr_gate_wait();
+    if (!real_cudaLaunchKernel) real_cudaLaunchKernel = (int (*)(const void *, gcr_dim3, gcr_dim3, void **, size_t, void *))gcr_next("cudaLaunchKernel");
+    return real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
 }
