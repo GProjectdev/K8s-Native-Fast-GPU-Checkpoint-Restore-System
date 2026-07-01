@@ -197,9 +197,11 @@ static void gcr_gate_set(int on) {
 static void gcr_gate_wait(void) {
     if (g_in_remap) return;                         // remap thread's own CUDA calls pass through
     if (!atomic_load(&g_gate)) return;              // fast path
+    fprintf(stderr, "[gcr] gate: kernel launch held until data remap completes\n"); fflush(stderr);
     pthread_mutex_lock(&g_gate_lock);
     while (atomic_load(&g_gate)) pthread_cond_wait(&g_gate_cv, &g_gate_lock);
     pthread_mutex_unlock(&g_gate_lock);
+    fprintf(stderr, "[gcr] gate: released, launch proceeds\n"); fflush(stderr);
 }
 
 static int gcr_vmm_enabled(void);
@@ -532,4 +534,40 @@ int cudaLaunchKernel(const void *func, gcr_dim3 gridDim, gcr_dim3 blockDim, void
     gcr_gate_wait();
     if (!real_cudaLaunchKernel) real_cudaLaunchKernel = (int (*)(const void *, gcr_dim3, gcr_dim3, void **, size_t, void *))gcr_next("cudaLaunchKernel");
     return real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
+}
+
+// ---- CUDA 12 / cooperative launch entry points (also gated) --------------
+// PyTorch 2.4 + CUDA 12 dispatch kernels through cuLaunchKernelEx, not just
+// cuLaunchKernel; cover the additional launch paths so the restore gate holds
+// every kernel until the data buffers are remapped.
+static CUresult_t (*real_cuLaunchKernelEx)(const void *, void *, void **, void **) = NULL;
+CUresult_t cuLaunchKernelEx(const void *config, void *f, void **kernelParams, void **extra) {
+    gcr_gate_wait();
+    if (!real_cuLaunchKernelEx) {
+        real_cuLaunchKernelEx = (CUresult_t (*)(const void *, void *, void **, void **))gcr_cuda_sym("cuLaunchKernelEx");
+        if (!real_cuLaunchKernelEx) real_cuLaunchKernelEx = (CUresult_t (*)(const void *, void *, void **, void **))gcr_next("cuLaunchKernelEx");
+    }
+    return real_cuLaunchKernelEx(config, f, kernelParams, extra);
+}
+
+static CUresult_t (*real_cuLaunchCooperativeKernel)(void *, unsigned, unsigned, unsigned,
+                                                    unsigned, unsigned, unsigned, unsigned,
+                                                    void *, void **) = NULL;
+CUresult_t cuLaunchCooperativeKernel(void *f, unsigned gx, unsigned gy, unsigned gz,
+                                     unsigned bx, unsigned by, unsigned bz,
+                                     unsigned shmem, void *stream, void **kparams) {
+    gcr_gate_wait();
+    if (!real_cuLaunchCooperativeKernel) {
+        real_cuLaunchCooperativeKernel = (CUresult_t (*)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **))gcr_cuda_sym("cuLaunchCooperativeKernel");
+        if (!real_cuLaunchCooperativeKernel) real_cuLaunchCooperativeKernel = (CUresult_t (*)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **))gcr_next("cuLaunchCooperativeKernel");
+    }
+    return real_cuLaunchCooperativeKernel(f, gx, gy, gz, bx, by, bz, shmem, stream, kparams);
+}
+
+// runtime CUDA 12 extended launch (struct-pointer + pointer args -> ABI-safe)
+static int (*real_cudaLaunchKernelExC)(const void *, const void *, void **) = NULL;
+int cudaLaunchKernelExC(const void *config, const void *func, void **args) {
+    gcr_gate_wait();
+    if (!real_cudaLaunchKernelExC) real_cudaLaunchKernelExC = (int (*)(const void *, const void *, void **))gcr_next("cudaLaunchKernelExC");
+    return real_cudaLaunchKernelExC(config, func, args);
 }
