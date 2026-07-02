@@ -401,8 +401,11 @@ DCN Progress Report의 세 가지 질문을 따릅니다.
 1. **GCR의 K8s 통합** — `GPUCheckpoint` CR + CR을 직접 watch하는 Node Agent(별도
    컨트롤러 없음). ✅ **완료·검증**: VMM 소유 데이터 엔진(복사 + 물리해제 + 주소보존 remap),
    cuda-checkpoint control, CRIU CPU-only, 비파괴적 resume.
-2. **tar → 새 컨테이너 복원** — 체크포인트 이미지를 재사용하려면 CRI-O 작업 필요;
-   순서 **Control State → GPU Data Buffer**. *(다음, 사용자 트리거)*
+2. **tar → 새 컨테이너 복원** — 순서 **Control State → GPU Data Buffer**. ✅ **완료·검증**:
+   자매 저장소 [K8s-Native-GPU-Restore-CRI-O](https://github.com/GProjectdev/K8s-Native-GPU-Restore-CRI-O)
+   의 Custom CRI-O 패치(staging · device cgroup · 서명 · annotation) + restore-agent가 담당.
+   같은 노드 복원과 노드 간 마이그레이션(HTTP pull) 모두 검증(cri-o v1.33.13, 드라이버 570.211.01).
+   본 저장소 인터셉터의 **RESTORE GATE**(cuLaunchKernel/Ex 등 후킹)로 remap-재개 race 해소.
 3. **증분 체크포인팅** — shadow execution + dirty templates로 변경된 버퍼만 저장(tar 크기
    축소). *(향후)*
 
