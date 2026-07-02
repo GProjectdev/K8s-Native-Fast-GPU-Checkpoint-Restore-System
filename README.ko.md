@@ -45,6 +45,11 @@
 
 ## 아키텍처
 
+![GCR on Kubernetes — 아키텍처](docs/img/architecture.png)
+
+> 보라 = 우리가 만든 GCR 컴포넌트 · 회색 = 재사용한 K8s 플랫폼 · 청록 = 체크포인트 데이터 경로. CRIU는 GPU를 안 건드리고, 인터셉터(데이터)+cuda-checkpoint(control)가 GPU 상태를 host 메모리로 내린 뒤 CRIU가 CPU+host 메모리를 덤프한다. 함께 보기: [`docs/K8S-CHALLENGES.ko.md`](docs/K8S-CHALLENGES.ko.md)(K8s 한계→해결), 슬라이드 [`docs/slides/GCR-K8s-limitations.pptx`](docs/slides/GCR-K8s-limitations.pptx).
+
+
 ```
                        Kubernetes Cluster
   Control Plane

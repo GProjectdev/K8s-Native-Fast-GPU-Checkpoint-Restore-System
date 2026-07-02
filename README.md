@@ -51,6 +51,10 @@ This project wires those mechanisms into Kubernetes primitives.
 
 ## Architecture
 
+![GCR on Kubernetes — architecture](docs/img/architecture.png)
+
+> Purple = our GCR components · gray = reused K8s platform · teal = checkpoint data path. CRIU never touches the GPU: the interceptor (data) + cuda-checkpoint (control) move GPU state to host memory first, then CRIU dumps CPU + host memory. See also [`docs/K8S-CHALLENGES.ko.md`](docs/K8S-CHALLENGES.ko.md) (K8s limitations → solutions) and slides [`docs/slides/GCR-K8s-limitations.pptx`](docs/slides/GCR-K8s-limitations.pptx).
+
 ```
                        Kubernetes Cluster
   Control Plane
