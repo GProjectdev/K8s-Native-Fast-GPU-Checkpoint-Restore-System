@@ -13,8 +13,9 @@
 > 보존), `cuda-checkpoint`가 control state, **CRIU는 CPU+host 데이터만** 덤프(CRIU
 > `cuda_plugin` 비활성화 → CRIU는 GPU를 안 건드림), 그다음 소스를 resume+remap. **별도
 > 컨트롤러 없음** — 각 Node Agent가 CR을 직접 watch. **새 VM부터 따라 실행하려면
-> [`docs/SETUP.ko.md`](docs/SETUP.ko.md)** 를 보세요. tar→새 컨테이너 복원은 CRI-O
-> 작업이 필요한 별개 단계입니다([로드맵](#로드맵)).
+> [`docs/SETUP.ko.md`](docs/SETUP.ko.md)** 를 보세요. tar→새 컨테이너 복원은 자매 저장소
+> **[K8s-Native-GPU-Restore-CRI-O](https://github.com/GProjectdev/K8s-Native-GPU-Restore-CRI-O)**
+> (Custom CRI-O + restore-agent)로 구현·검증되었습니다([로드맵](#로드맵)).
 
 본 작업의 기반:
 
