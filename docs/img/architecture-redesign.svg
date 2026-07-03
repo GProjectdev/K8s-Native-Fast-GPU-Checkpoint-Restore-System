@@ -1,0 +1,75 @@
+<svg viewBox="0 0 780 500" xmlns="http://www.w3.org/2000/svg">
+<style>
+.h{font-family:'Noto Sans CJK KR','DejaVu Sans',sans-serif;font-weight:700;font-size:13px}
+.t{font-family:'Noto Sans CJK KR','DejaVu Sans',sans-serif;font-weight:700;font-size:11.5px}
+.s{font-family:'Noto Sans CJK KR','DejaVu Sans',sans-serif;font-weight:400;font-size:10px}
+.a{font-family:'Noto Sans CJK KR','DejaVu Sans',sans-serif;font-weight:400;font-size:9.5px;fill:#444}
+</style>
+<defs>
+<marker id="m" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#555"/></marker>
+<marker id="md" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#96631a"/></marker>
+<marker id="mg" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#3c7a28"/></marker></defs>
+<rect x="6" y="6" width="768" height="488" rx="6" fill="none" stroke="#333"/>
+<text class="h" x="16" y="24" fill="#222">Kubernetes Cluster</text>
+
+<rect x="18" y="32" width="744" height="82" rx="5" fill="#F5F9FF" stroke="#9DB6E0"/>
+<text class="t" x="28" y="50" fill="#33507a">Control Plane</text>
+<rect x="540" y="50" width="200" height="46" rx="4" fill="#DCE6F5" stroke="#6f9bd1"/>
+<text class="t" x="640" y="77" text-anchor="middle" fill="#1f3b63">GPUCheckpoint CR</text>
+
+<rect x="18" y="124" width="744" height="364" rx="5" fill="#FCFCFC" stroke="#B7B7B7"/>
+<text class="t" x="28" y="142" fill="#444">Worker Node</text>
+
+<rect x="36" y="156" width="252" height="150" rx="5" fill="#FFFFFF" stroke="#8a8a8a"/>
+<text class="t" x="46" y="174" fill="#444">GPU Pod</text>
+<rect x="50" y="182" width="224" height="32" rx="4" fill="#CFE2F3" stroke="#6f9bd1"/>
+<text class="t" x="162" y="203" text-anchor="middle" fill="#1f3b63">GPU APP</text>
+<rect x="50" y="222" width="224" height="72" rx="4" fill="#FFF2CC" stroke="#d6b656"/>
+<text class="t" x="162" y="243" text-anchor="middle" fill="#7a5b00">GPU Selective Interceptor (library)</text>
+<text class="s" x="162" y="261" text-anchor="middle" fill="#7a5b00">VMM 소유: cudaMalloc→cuMemCreate/Map</text>
+<text class="s" x="162" y="278" text-anchor="middle" fill="#7a5b00">freeze(D2H+물리해제) / remap(같은 VA)</text>
+
+<rect x="36" y="330" width="252" height="46" rx="5" fill="#D9EAD3" stroke="#6aa84f"/>
+<text class="t" x="162" y="350" text-anchor="middle" fill="#2c5320">host memory (프로세스 내)</text>
+<text class="s" x="162" y="366" text-anchor="middle" fill="#2c5320">GPU 데이터 + control state</text>
+
+<rect x="546" y="158" width="200" height="60" rx="5" fill="#F9CB9C" stroke="#cc8b53"/>
+<text class="t" x="646" y="182" text-anchor="middle" fill="#6b3e12">GPU C/R Node Agent</text>
+<text class="s" x="646" y="199" text-anchor="middle" fill="#6b3e12">오케스트레이터 · 5단계 조율</text>
+
+<rect x="546" y="250" width="200" height="54" rx="5" fill="#FDEBD0" stroke="#cc8b53" stroke-dasharray="4 3"/>
+<text class="t" x="646" y="272" text-anchor="middle" fill="#96631a">cuda-checkpoint Host Helper</text>
+<text class="s" x="646" y="289" text-anchor="middle" fill="#96631a">＋추가 · 호스트 네이티브 실행</text>
+
+<rect x="308" y="410" width="284" height="54" rx="5" fill="#ECECEC" stroke="#999" stroke-dasharray="4 3"/>
+<text class="t" x="450" y="432" text-anchor="middle" fill="#333">kubelet · CRI-O · CRIU</text>
+<text class="s" x="450" y="449" text-anchor="middle" fill="#333">＋추가 · CPU only, cuda_plugin off</text>
+
+<text class="t" x="672" y="404" text-anchor="middle" fill="#2c5320">Shared Storage</text>
+<rect x="612" y="410" width="140" height="54" rx="5" fill="#B6D7A8" stroke="#6aa84f"/>
+<text class="t" x="682" y="441" text-anchor="middle" fill="#254a17">Checkpoint.tar</text>
+
+<line x1="640" y1="96" x2="646" y2="157" stroke="#555" marker-end="url(#m)"/>
+<text class="a" x="654" y="128">Watch</text>
+
+<line x1="546" y1="180" x2="278" y2="240" stroke="#555" marker-end="url(#m)"/>
+<text class="a" x="300" y="208">① freeze / ⑤ remap (control 파일)</text>
+
+<line x1="646" y1="218" x2="646" y2="249" stroke="#555" marker-end="url(#m)"/>
+<text class="a" x="654" y="238">② 요청 (.req/.res)</text>
+
+<line x1="546" y1="280" x2="278" y2="280" stroke="#96631a" stroke-dasharray="4 3" marker-end="url(#md)"/>
+<text class="a" x="330" y="296" fill="#96631a">cuda-checkpoint (실제 GPU PID · control)</text>
+
+<line x1="162" y1="294" x2="162" y2="329" stroke="#555" marker-end="url(#m)"/>
+<text class="a" x="170" y="316">data (D2H)</text>
+
+<line x1="600" y1="218" x2="470" y2="409" stroke="#555" marker-end="url(#m)"/>
+<text class="a" x="470" y="248" text-anchor="end">③ checkpoint API</text>
+
+<line x1="290" y1="358" x2="312" y2="426" stroke="#3c7a28" stroke-dasharray="4 3" marker-end="url(#mg)"/>
+<text class="a" x="250" y="392" fill="#2c5320">CRIU가 host 메모리 캡처</text>
+
+<line x1="592" y1="437" x2="611" y2="437" stroke="#555" marker-end="url(#m)"/>
+<text class="a" x="600" y="482">④ store (tar)</text>
+</svg>
