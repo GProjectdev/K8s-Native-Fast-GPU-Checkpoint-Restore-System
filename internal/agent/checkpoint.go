@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,26 +12,40 @@ import (
 	gpucrv1alpha1 "github.com/GProjectdev/K8s-Native-Fast-GPU-Checkpoint-Restore-System/api/v1alpha1"
 )
 
-// Checkpointer performs the container checkpoint on the local node using the
-// CRIUgpu path: the kubelet checkpoint API drives CRI-O + CRIU, and the NVIDIA
-// CRIU cuda_plugin checkpoints the GPU as part of the container checkpoint.
-// The agent only orchestrates: resolve target -> kubelet checkpoint -> store.
+// Checkpointer runs the GCR checkpoint pipeline on the local node, using GCR's
+// control/data separation but with the CONTROL STATE handled by CRIUgpu:
+//
+//  1. Selective Interception data checkpoint (in-Pod interceptor): copy the GPU
+//     data buffers to host memory and free the physical GPU memory while keeping
+//     the virtual addresses. The device is then left with only GPU control state.
+//  2. CRIUgpu container checkpoint via the kubelet API: CRI-O + CRIU + the NVIDIA
+//     cuda_plugin checkpoint the remaining GPU control state AND dump the CPU
+//     process (including the host-resident data buffers) into a tar. (This
+//     replaces the earlier host cuda-checkpoint helper.)
+//  3. Store the tar to the CR-defined backend.
+//  4. Remap the data buffers back to the device (non-destructive resume) via the
+//     interceptor.
 type Checkpointer struct {
-	Kubelet *KubeletClient
+	Interceptor *InterceptorManager
+	Kubelet     *KubeletClient
+	// GCRInterception gates the Selective Interception data steps (1 and 4). When
+	// false, CRIUgpu alone handles the whole GPU (no control/data separation).
+	GCRInterception bool
 	// DryRun skips the privileged kubelet checkpoint (dev clusters without GPUs);
 	// the control flow, status updates and storage layout still run end-to-end.
 	DryRun bool
 }
 
-// NewCheckpointer wires the checkpointer.
-func NewCheckpointer(kc *KubeletClient, dryRun bool) *Checkpointer {
-	return &Checkpointer{Kubelet: kc, DryRun: dryRun}
+// NewCheckpointer wires the pipeline with sane defaults.
+func NewCheckpointer(im *InterceptorManager, kc *KubeletClient, dryRun bool) *Checkpointer {
+	return &Checkpointer{Interceptor: im, Kubelet: kc, GCRInterception: true, DryRun: dryRun}
 }
 
 // Target describes a resolved checkpoint target on this node.
 type Target struct {
 	Namespace string
 	Pod       string
+	PodUID    string // keys the interceptor control channel
 	Container string
 	Storage   gpucrv1alpha1.StorageSpec
 }
@@ -43,13 +56,28 @@ type Result struct {
 	TakenAt     time.Time
 }
 
-// Checkpoint takes the container checkpoint (CRIUgpu) and stores the archive.
+// Checkpoint runs the pipeline and returns the stored archive path.
 func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error) {
 	start := time.Now()
-	klog.Infof("checkpoint start: pod=%s/%s container=%s (CRIUgpu)", t.Namespace, t.Pod, t.Container)
+	klog.Infof("checkpoint start: pod=%s/%s container=%s (GCR interception + CRIUgpu)",
+		t.Namespace, t.Pod, t.Container)
 
-	// (1) Container checkpoint via the kubelet API. CRI-O + CRIU + the NVIDIA
-	// cuda_plugin checkpoint both the CPU process and the GPU state.
+	// (1) Selective Interception data checkpoint: interceptor copies GPU data
+	// buffers to host memory and frees the physical GPU memory (keeps the VA).
+	if c.GCRInterception {
+		if err := c.Interceptor.Signal(t.PodUID, GCRSignalCkpt); err != nil {
+			return nil, fmt.Errorf("signal data-buffer checkpoint: %w", err)
+		}
+		if !c.DryRun {
+			if err := c.Interceptor.WaitForAck(t.PodUID, 120*time.Second); err != nil {
+				return nil, fmt.Errorf("data-buffer checkpoint did not ack: %w", err)
+			}
+		}
+		klog.V(2).Info("step 1/4 done: GPU data buffers checkpointed to host, physical memory freed")
+	}
+
+	// (2) CRIUgpu container checkpoint via the kubelet API. cuda_plugin
+	// checkpoints the remaining GPU control state; CRIU dumps CPU + host data.
 	var produced []string
 	if c.DryRun {
 		produced = []string{c.simulatedArchive(t)}
@@ -57,22 +85,41 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 		var err error
 		produced, err = c.Kubelet.Checkpoint(ctx, t.Namespace, t.Pod, t.Container)
 		if err != nil {
-			return nil, fmt.Errorf("kubelet container checkpoint: %w", err)
+			// Best-effort remap so we don't leave the source with freed data.
+			if c.GCRInterception {
+				_ = c.Interceptor.Signal(t.PodUID, GCRSignalRestore)
+			}
+			return nil, fmt.Errorf("kubelet CRIUgpu checkpoint: %w", err)
 		}
 	}
-	klog.V(2).Infof("step 1/2 done: kubelet produced %v", produced)
+	klog.V(2).Infof("step 2/4 done: CRIUgpu produced %v", produced)
 
-	// (2) Store to the backend declared in the CR.
+	// (3) Store to the backend declared in the CR.
 	stored, err := c.store(t, produced)
 	if err != nil {
+		if c.GCRInterception {
+			_ = c.Interceptor.Signal(t.PodUID, GCRSignalRestore)
+		}
 		return nil, fmt.Errorf("store checkpoint: %w", err)
 	}
-	klog.Infof("step 2/2 done: checkpoint stored at %s; took %s", stored, time.Since(start))
+	klog.V(2).Infof("step 3/4 done: stored checkpoint at %s", stored)
+
+	// (4) Remap the data buffers back to the device so the source keeps running.
+	if c.GCRInterception {
+		if err := c.Interceptor.Signal(t.PodUID, GCRSignalRestore); err != nil {
+			klog.Errorf("signal data remap failed: %v", err)
+		} else if !c.DryRun {
+			if err := c.Interceptor.WaitForAck(t.PodUID, 120*time.Second); err != nil {
+				klog.Errorf("data remap did not ack: %v", err)
+			}
+		}
+	}
+	klog.Infof("step 4/4 done: checkpoint stored at %s; source resumed (remapped); took %s",
+		stored, time.Since(start))
 	return &Result{ArchivePath: stored, TakenAt: start}, nil
 }
 
-// store copies the produced archive into the CR-defined backend and returns the
-// canonical stored path.
+// store copies the produced archive into the CR-defined backend.
 func (c *Checkpointer) store(t Target, produced []string) (string, error) {
 	switch t.Storage.Type {
 	case gpucrv1alpha1.StorageHostPath, gpucrv1alpha1.StorageNFS, "":
@@ -106,21 +153,4 @@ func (c *Checkpointer) store(t Target, produced []string) (string, error) {
 func (c *Checkpointer) simulatedArchive(t Target) string {
 	return filepath.Join("/var/lib/kubelet/checkpoints",
 		fmt.Sprintf("checkpoint-%s_%s-%s.tar", t.Pod, t.Namespace, t.Container))
-}
-
-func copyFile(src, dst string, mode os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Chmod(mode)
 }

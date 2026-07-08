@@ -1,5 +1,7 @@
-# Plain GPU workload for CRIUgpu checkpointing (no interceptor / no LD_PRELOAD).
-# CRIU + the NVIDIA cuda_plugin checkpoint the GPU transparently.
+# GPU workload wired for the GCR Selective Interception data engine.
+# The interceptor (LD_PRELOAD) owns cudaMalloc via the CUDA VMM API and, on the
+# agent's signal, checkpoints/frees the GPU DATA buffers to host memory (and
+# remaps them back on resume). GPU CONTROL STATE + CPU are checkpointed by CRIUgpu.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -22,6 +24,43 @@ spec:
           print("GPU tensor allocated:", x.shape, "device:", x.device, flush=True)
           while True:
               time.sleep(3600)
+      env:
+        # GCR interceptor owns cudaMalloc via VMM (framework-agnostic).
+        - name: GCR_VMM_ALLOC
+          value: "1"
+        - name: LD_PRELOAD
+          value: /opt/gpu-cr/libgcr-interceptor.so
+        - name: GCR_HOME
+          value: /opt/gpu-cr
+        - name: GCR_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: GCR_CONTROL_DIR
+          value: /var/lib/gpu-cr/run
+        - name: GCR_DATA_DIR
+          value: /var/lib/gcr-checkpoint
       resources:
         limits:
           nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: gpu-cr-lib
+          mountPath: /opt/gpu-cr
+          readOnly: true
+        - name: gpu-cr-run
+          mountPath: /var/lib/gpu-cr/run
+        - name: gcr-checkpoint
+          mountPath: /var/lib/gcr-checkpoint
+  volumes:
+    - name: gpu-cr-lib
+      hostPath:
+        path: /var/lib/gpu-cr/lib
+        type: Directory
+    - name: gpu-cr-run
+      hostPath:
+        path: /var/lib/gpu-cr/run
+        type: DirectoryOrCreate
+    - name: gcr-checkpoint
+      hostPath:
+        path: /var/lib/gcr-checkpoint
+        type: DirectoryOrCreate

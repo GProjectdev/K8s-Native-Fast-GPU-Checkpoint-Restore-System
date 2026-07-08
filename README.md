@@ -9,24 +9,32 @@ its own node).
 
 ## Branches
 
-- **`main` (this branch) — CRIUgpu.** The GPU+CPU checkpoint is done by the
-  **kubelet Checkpoint API → CRI-O → CRIU + the NVIDIA `cuda_plugin`**. The Node
-  Agent only orchestrates: resolve the target → call the kubelet checkpoint API →
-  store the produced tar. No in-Pod interceptor and no host cuda-checkpoint helper.
-- **`v1.0` — GCR data engine.** The GCR-paper approach: an in-Pod VMM interceptor
-  (owns `cudaMalloc`, freeze/remap) + a host `cuda-checkpoint` helper + CRIU
-  (CPU-only, `cuda_plugin` disabled). Preserved on the `v1.0` branch.
+- **`main` (this branch) — GCR interception (data) + CRIUgpu (control).** Keeps
+  GCR's control/data separation: the in-Pod interceptor does the Selective
+  Interception **data** checkpoint (owns `cudaMalloc` via the CUDA VMM API;
+  freeze/remap), and the GPU **control state** is checkpointed by **CRIU + the
+  NVIDIA `cuda_plugin`** via the kubelet Checkpoint API (CRIUgpu) — replacing the
+  earlier host `cuda-checkpoint` helper.
+- **`v1.0` — GCR interception (data) + host cuda-checkpoint helper (control).**
+  Control state via a host `cuda-checkpoint` helper + plain CRIU (`cuda_plugin`
+  disabled). Preserved on the `v1.0` branch.
 
-## How it works (main / CRIUgpu)
+## How it works (main)
 
-1. User applies a `GPUCheckpoint` CR (`workloadRef`, `storage`, `schedule`).
-2. The Node Agent on the target node calls the **kubelet Checkpoint API**. CRI-O
-   drives **CRIU + the NVIDIA cuda_plugin**, which checkpoint the container's CPU
-   process *and* GPU state into a tar.
-3. The agent copies that tar to `.spec.storage.path`.
+GCR control/data separation, with the **control state handled by CRIUgpu**:
 
-Requires **NVIDIA driver 570+** (so `cuda-checkpoint` releases the `/dev/nvidia*`
-fds and CRIU can dump) and the **CRIU cuda_plugin installed/enabled**.
+1. **Data (Selective Interception)** — the in-Pod interceptor (LD_PRELOAD; owns
+   `cudaMalloc` via the CUDA VMM API) copies the GPU data buffers to host memory
+   and frees the physical GPU memory while keeping the virtual addresses. The
+   device is left with only GPU control state.
+2. **Control + CPU (CRIUgpu)** — the agent calls the kubelet Checkpoint API;
+   CRI-O + CRIU + the NVIDIA `cuda_plugin` checkpoint the remaining GPU control
+   state and dump the CPU process (incl. the host-resident data) into a tar.
+3. **Store** the tar to `.spec.storage.path`.
+4. **Remap** — the interceptor maps the data buffers back to the device
+   (non-destructive resume).
+
+Requires **NVIDIA driver 570+** and the **CRIU `cuda_plugin` installed/enabled**.
 
 ## GPUCheckpoint CR
 

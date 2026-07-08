@@ -58,6 +58,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if container == "" && len(pod.Spec.Containers) > 0 {
 		container = pod.Spec.Containers[0].Name
 	}
+	podUID := string(pod.UID) // keys the interceptor control channel
 
 	// Only the agent on the target node proceeds.
 	if targetNode != r.NodeName {
@@ -91,6 +92,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	target := Target{
 		Namespace: cr.Spec.WorkloadRef.Namespace,
 		Pod:       cr.Spec.WorkloadRef.Name,
+		PodUID:    podUID,
 		Container: container,
 		Storage:   cr.Spec.Storage,
 	}

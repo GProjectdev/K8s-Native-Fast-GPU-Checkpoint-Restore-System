@@ -1,15 +1,16 @@
 # Setup & Usage — CRIUgpu 방식 (VM 생성 이후 따라만 하면 동작)
 
-이 브랜치(main)는 GPU 체크포인트를 **CRIUgpu**로 수행합니다. Node Agent는 오케스트레이션만
-하고, 실제 GPU+CPU 체크포인트는 **kubelet Checkpoint API → CRI-O → CRIU + NVIDIA cuda_plugin**
-이 담당합니다. (인터셉터/LD_PRELOAD·호스트 cuda-checkpoint 헬퍼는 사용하지 않습니다 — 그건
-`v1.0` 브랜치의 GCR 데이터 엔진 방식입니다.)
+이 브랜치(main)는 GCR의 control/data 분리를 유지하되 **control state를 CRIUgpu로** 처리합니다:
+인-Pod 인터셉터가 **데이터**(Selective Interception, VMM 소유 freeze/remap)를, **control state +
+CPU**는 **kubelet Checkpoint API → CRI-O → CRIU + NVIDIA cuda_plugin**(CRIUgpu)이 담당합니다.
+(예전의 호스트 cuda-checkpoint 헬퍼를 CRIUgpu가 대체 — `v1.0` 브랜치는 헬퍼 방식.)
 
 ## 0. 동작 개요
 
 `GPUCheckpoint` CR을 만들면, 대상 노드의 Node Agent가:
-1. **kubelet Checkpoint API** 호출 → CRI-O/CRIU + **cuda_plugin** 이 컨테이너(CPU + GPU)를 tar로 생성
-2. 그 tar를 CR `.spec.storage.path`로 저장
+1. **인터셉터**가 GPU 데이터 버퍼를 host로 복사 + 물리해제(VA 보존)  [Selective Interception]
+2. **kubelet Checkpoint API** → CRI-O/CRIU + **cuda_plugin** 이 남은 GPU control state + CPU를 tar로  [CRIUgpu]
+3. 그 tar를 CR `.spec.storage.path`로 저장 → 인터셉터가 데이터 remap(복귀)
 
 > 전제: **NVIDIA 드라이버 570+** (cuda-checkpoint가 `/dev/nvidia*` fd까지 release해야 CRIU 성공),
 > **CRIU cuda_plugin 설치/활성화**, 단일 300GB 부팅 디스크.
@@ -49,7 +50,7 @@ kubectl -n gpu-cr-system rollout restart ds/gpu-cr-node-agent
 
 ## 6. 실행 + 체크포인트
 ```bash
-kubectl apply -f deploy/sample-pod.yaml                # 평범한 GPU Pod (인터셉터 없음)
+kubectl apply -f deploy/sample-pod.yaml                # GPU Pod (인터셉터 LD_PRELOAD + GCR_VMM_ALLOC)
 kubectl get pod cuda-sample-pod -o wide -w             # Running
 kubectl apply -f deploy/sample-gpucheckpoint.yaml      # GPUCheckpoint CR
 kubectl get gpucheckpoints.gpu-cr.io -w                # Checkpointing -> Completed

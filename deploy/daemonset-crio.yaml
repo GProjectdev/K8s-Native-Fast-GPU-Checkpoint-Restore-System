@@ -1,8 +1,8 @@
-# GPU C/R Node Agent — CRIUgpu variant (CRI-O + CRIU + NVIDIA cuda_plugin).
-# The agent only orchestrates: it watches GPUCheckpoint CRs and calls the kubelet
-# checkpoint API, which drives CRI-O/CRIU (with the cuda_plugin) to checkpoint the
-# container (CPU + GPU) into a tar; the agent then stores it. No in-Pod interceptor
-# and no host cuda-checkpoint helper are needed.
+# GPU C/R Node Agent — GCR interception + CRIUgpu (CRI-O).
+# Pipeline: the in-Pod interceptor does the Selective Interception DATA checkpoint
+# (LD_PRELOAD), and the agent calls the kubelet Checkpoint API so CRI-O/CRIU +
+# the NVIDIA cuda_plugin checkpoint the GPU CONTROL STATE together with the CPU
+# process. No host cuda-checkpoint helper.
 #   - hostNetwork so the agent can reach the local kubelet (127.0.0.1:10250)
 #   - metrics/health on :9290/:9291 (8080/8081 collide under hostNetwork)
 # Set `image:` to your registry tag before applying.
@@ -33,13 +33,14 @@ spec:
           effect: NoSchedule
       containers:
         - name: node-agent
-          # Reused tag while iterating -> imagePullPolicy: Always so the node
-          # always pulls the freshly rebuilt image.
           image: docker.io/jeongseungjun/gpu-cr-node-agent:latest
           imagePullPolicy: Always
           args:
             - --kubelet-url=https://127.0.0.1:10250
             - --kubelet-insecure=true
+            - --host-lib-dir=/host/gpu-cr/lib
+            - --host-run-dir=/host/gpu-cr/run
+            - --interceptor-dist-dir=/opt/gpu-cr-dist
             - --dry-run=false
             - --metrics-bind-address=:9290
             - --health-probe-bind-address=:9291
@@ -51,7 +52,10 @@ spec:
           securityContext:
             privileged: true
           volumeMounts:
-            # kubelet writes the checkpoint tar here; the agent reads it.
+            # Interceptor library dir + GCR control channels shared with GPU Pods.
+            - name: gpu-cr-host
+              mountPath: /host/gpu-cr
+            # kubelet writes the CRIUgpu checkpoint tar here; the agent reads it.
             - name: kubelet-checkpoints
               mountPath: /var/lib/kubelet/checkpoints
             # Checkpoint output dir — MUST match .spec.storage.path in your CRs.
@@ -71,6 +75,10 @@ spec:
               port: 9291
             initialDelaySeconds: 10
       volumes:
+        - name: gpu-cr-host
+          hostPath:
+            path: /var/lib/gpu-cr
+            type: DirectoryOrCreate
         - name: kubelet-checkpoints
           hostPath:
             path: /var/lib/kubelet/checkpoints
