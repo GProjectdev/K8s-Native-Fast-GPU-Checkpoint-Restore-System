@@ -1,9 +1,10 @@
-# GPU C/R Node Agent — CRI-O variant (verified on K8s v1.33 + CRI-O v1.33).
-# Differences from deploy/daemonset.yaml (containerd):
-#   - CRI socket DIRECTORY /run/crio mounted (not the .sock file) so crio restarts
-#     don't stale the mount; CONTAINER_RUNTIME_ENDPOINT points at it.
-#   - metrics/health on :9290/:9291 (8080/8081 collide under hostNetwork).
-#   - checkpoint output dir + cuda-checkpoint host binary wired.
+# GPU C/R Node Agent — CRIUgpu variant (CRI-O + CRIU + NVIDIA cuda_plugin).
+# The agent only orchestrates: it watches GPUCheckpoint CRs and calls the kubelet
+# checkpoint API, which drives CRI-O/CRIU (with the cuda_plugin) to checkpoint the
+# container (CPU + GPU) into a tar; the agent then stores it. No in-Pod interceptor
+# and no host cuda-checkpoint helper are needed.
+#   - hostNetwork so the agent can reach the local kubelet (127.0.0.1:10250)
+#   - metrics/health on :9290/:9291 (8080/8081 collide under hostNetwork)
 # Set `image:` to your registry tag before applying.
 apiVersion: apps/v1
 kind: DaemonSet
@@ -22,7 +23,6 @@ spec:
         app.kubernetes.io/name: gpu-cr-node-agent
     spec:
       serviceAccountName: gpu-cr-node-agent
-      hostPID: true
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
@@ -33,17 +33,13 @@ spec:
           effect: NoSchedule
       containers:
         - name: node-agent
-          # NOTE: while iterating you may keep ONE tag (e.g. :v1.0) and rebuild it.
-          # With a reused tag you MUST use imagePullPolicy: Always, otherwise the
-          # node keeps the cached old image and your new code never runs.
-          image: docker.io/jeongseungjun/gpu-cr-node-agent:v1.0
+          # Reused tag while iterating -> imagePullPolicy: Always so the node
+          # always pulls the freshly rebuilt image.
+          image: docker.io/jeongseungjun/gpu-cr-node-agent:latest
           imagePullPolicy: Always
           args:
             - --kubelet-url=https://127.0.0.1:10250
             - --kubelet-insecure=true
-            - --host-lib-dir=/host/gpu-cr/lib
-            - --host-run-dir=/host/gpu-cr/run
-            - --interceptor-dist-dir=/opt/gpu-cr-dist
             - --dry-run=false
             - --metrics-bind-address=:9290
             - --health-probe-bind-address=:9291
@@ -52,39 +48,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: CONTAINER_RUNTIME_ENDPOINT
-              value: unix:///run/crio/crio.sock
-            - name: CUDA_CHECKPOINT_BIN
-              value: /host/usr/bin/cuda-checkpoint
-            # cuda-checkpoint dynamically links libcuda.so.1 (the host NVIDIA
-            # driver lib), absent from the agent image; expose it via LD_LIBRARY_PATH.
-            - name: LD_LIBRARY_PATH
-              value: /host/usr/lib/x86_64-linux-gnu
-            # Delegate cuda-checkpoint to the HOST helper service
-            # (gpu-cr-cuda-helper.service). In-container execution stack-smashes
-            # due to glibc ABI mismatch; the helper runs it natively and targets
-            # the real GPU PID in the container subtree. This dir maps to the
-            # host's /var/lib/gpu-cr/cuda-req (via the gpu-cr-host mount).
-            - name: CUDA_CHECKPOINT_HELPER_DIR
-              value: /host/gpu-cr/cuda-req
           securityContext:
             privileged: true
           volumeMounts:
-            - name: gpu-cr-host
-              mountPath: /host/gpu-cr
-            - name: host-usr-bin
-              mountPath: /host/usr/bin
-              readOnly: true
-            # Host NVIDIA driver libraries (libcuda.so.1) for cuda-checkpoint.
-            - name: host-usr-lib
-              mountPath: /host/usr/lib/x86_64-linux-gnu
-              readOnly: true
+            # kubelet writes the checkpoint tar here; the agent reads it.
             - name: kubelet-checkpoints
               mountPath: /var/lib/kubelet/checkpoints
+            # Checkpoint output dir — MUST match .spec.storage.path in your CRs.
             - name: gcr-checkpoint
               mountPath: /var/lib/gcr-checkpoint
-            - name: cri-sock
-              mountPath: /run/crio
           ports:
             - name: metrics
               containerPort: 9290
@@ -99,18 +71,6 @@ spec:
               port: 9291
             initialDelaySeconds: 10
       volumes:
-        - name: gpu-cr-host
-          hostPath:
-            path: /var/lib/gpu-cr
-            type: DirectoryOrCreate
-        - name: host-usr-bin
-          hostPath:
-            path: /usr/bin
-            type: Directory
-        - name: host-usr-lib
-          hostPath:
-            path: /usr/lib/x86_64-linux-gnu
-            type: Directory
         - name: kubelet-checkpoints
           hostPath:
             path: /var/lib/kubelet/checkpoints
@@ -119,7 +79,3 @@ spec:
           hostPath:
             path: /var/lib/gcr-checkpoint
             type: DirectoryOrCreate
-        - name: cri-sock
-          hostPath:
-            path: /run/crio
-            type: Directory

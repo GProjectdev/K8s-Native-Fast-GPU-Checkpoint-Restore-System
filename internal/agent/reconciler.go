@@ -36,25 +36,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Always resolve the Pod: the interceptor control channel is keyed by the
-	// Pod UID, and node/container are filled from the Pod when the CR omits them.
+	// Only kind=Pod is resolved today; other workload kinds are reserved.
+	if k := cr.Spec.WorkloadRef.Kind; k != "" && k != "Pod" {
+		return r.fail(ctx, &cr, "workloadRef.kind "+k+" not supported yet (only Pod)")
+	}
+
+	// Resolve the Pod: node/container are filled from the Pod when the CR omits them.
 	var pod corev1.Pod
-	key := types.NamespacedName{Namespace: cr.Spec.PodRef.Namespace, Name: cr.Spec.PodRef.Name}
+	key := types.NamespacedName{Namespace: cr.Spec.WorkloadRef.Namespace, Name: cr.Spec.WorkloadRef.Name}
 	if err := r.Get(ctx, key, &pod); err != nil {
 		if apierrors.IsNotFound(err) {
 			return r.fail(ctx, &cr, "target Pod not found")
 		}
 		return ctrl.Result{}, err
 	}
-	targetNode := cr.Spec.PodRef.NodeInfo
+	targetNode := cr.Spec.WorkloadRef.NodeInfo
 	if targetNode == "" {
 		targetNode = pod.Spec.NodeName
 	}
-	container := cr.Spec.PodRef.Container
+	container := cr.Spec.WorkloadRef.Container
 	if container == "" && len(pod.Spec.Containers) > 0 {
 		container = pod.Spec.Containers[0].Name
 	}
-	podUID := string(pod.UID)
 
 	// Only the agent on the target node proceeds.
 	if targetNode != r.NodeName {
@@ -62,9 +65,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	period, err := ParsePeriod(cr.Spec.Period)
+	period, err := ParseSchedule(cr.Spec.Schedule)
 	if err != nil {
-		return r.fail(ctx, &cr, "invalid period: "+err.Error())
+		return r.fail(ctx, &cr, "invalid schedule: "+err.Error())
 	}
 
 	// Decide whether a checkpoint is due now.
@@ -85,21 +88,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	cr.Status.ObservedNode = targetNode
 	_ = r.Status().Update(ctx, &cr)
 
-	// Resolve container PID on this node.
-	cid, pid, err := r.Checkpointer.ResolvePID(ctx, cr.Spec.PodRef.Namespace, cr.Spec.PodRef.Name, container)
-	if err != nil {
-		return r.fail(ctx, &cr, "resolve container pid: "+err.Error())
-	}
-
 	target := Target{
-		Namespace:   cr.Spec.PodRef.Namespace,
-		Pod:         cr.Spec.PodRef.Name,
-		PodUID:      podUID,
-		Container:   container,
-		ContainerID: cid,
-		HostPID:     pid,
-		Incremental: cr.Spec.Incremental && cr.Status.CheckpointCount > 0,
-		Storage:     cr.Spec.Storage,
+		Namespace: cr.Spec.WorkloadRef.Namespace,
+		Pod:       cr.Spec.WorkloadRef.Name,
+		Container: container,
+		Storage:   cr.Spec.Storage,
 	}
 
 	res, err := r.Checkpointer.Checkpoint(ctx, target)
@@ -165,8 +158,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&gpucrv1alpha1.GPUCheckpoint{}).
 		// Only reconcile on spec changes (create/spec-update) and our own
 		// RequeueAfter timers — NOT on our own status writes, which would
-		// otherwise retrigger reconcile in a tight loop and repeatedly toggle
-		// cuda-checkpoint, crashing the workload.
+		// otherwise retrigger reconcile in a tight loop.
 		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }

@@ -4,26 +4,31 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// PodRef identifies the GPU Pod (and container) to be checkpointed.
-type PodRef struct {
-	// Namespace of the target Pod.
+// WorkloadRef identifies the GPU workload (and container) to checkpoint. It
+// generalizes the earlier PodRef via a Kind selector: "Pod" is supported today;
+// "Deployment"/"StatefulSet" are reserved for future multi-replica resolution.
+type WorkloadRef struct {
+	// Kind of the target workload.
+	// +kubebuilder:validation:Enum=Pod;Deployment;StatefulSet
+	// +kubebuilder:default=Pod
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// Namespace of the target workload.
 	// +kubebuilder:validation:Required
 	Namespace string `json:"namespace"`
 
-	// Name of the target Pod.
+	// Name of the target workload (the Pod name when kind=Pod).
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
 
-	// Container is the name of the GPU container inside the Pod.
-	// If empty, the first container is used.
+	// Container is the name of the GPU container. If empty, the first is used.
 	// +optional
 	Container string `json:"container,omitempty"`
 
-	// NodeInfo names the node the target Pod runs on. Per the DCN design, the
-	// GPUCheckpoint CR carries everything the Node Agent needs, so the agent can
-	// act directly on the CR (it watches CRs and only handles those whose
-	// NodeInfo matches the node it runs on). When empty, the agent falls back to
-	// resolving the node from the Pod's spec.nodeName at reconcile time.
+	// NodeInfo names the node the target runs on. The CR carries everything the
+	// Node Agent needs; each agent only handles CRs whose NodeInfo matches its
+	// node. When empty, the agent resolves the node from the Pod at reconcile.
 	// +optional
 	NodeInfo string `json:"nodeInfo,omitempty"`
 }
@@ -56,20 +61,18 @@ type StorageSpec struct {
 
 // GPUCheckpointSpec defines the desired checkpoint behaviour for a Pod.
 type GPUCheckpointSpec struct {
-	// PodRef points at the Pod (and container) to checkpoint.
+	// WorkloadRef points at the workload (and container) to checkpoint.
 	// +kubebuilder:validation:Required
-	PodRef PodRef `json:"podRef"`
+	WorkloadRef WorkloadRef `json:"workloadRef"`
 
 	// Storage defines the checkpoint backend and path.
 	// +kubebuilder:validation:Required
 	Storage StorageSpec `json:"storage"`
 
-	// Period is the checkpoint interval encoded as a fixed-width HHMMSS string
-	// (e.g. "000500" == every 5 minutes, "010000" == hourly). An empty value
-	// or "000000" means a single one-shot checkpoint.
-	// +kubebuilder:validation:Pattern=`^[0-9]{6}$`
+	// Schedule is the checkpoint interval as a Go duration string
+	// (e.g. "30s", "5m", "1h"). An empty value means a single one-shot checkpoint.
 	// +optional
-	Period string `json:"period,omitempty"`
+	Schedule string `json:"schedule,omitempty"`
 
 	// Incremental enables GCR shadow-execution based incremental checkpointing
 	// for checkpoints after the first one (dirty buffers only).
@@ -124,9 +127,9 @@ type GPUCheckpointStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=gpuckpt
-// +kubebuilder:printcolumn:name="Pod",type=string,JSONPath=`.spec.podRef.name`
+// +kubebuilder:printcolumn:name="Workload",type=string,JSONPath=`.spec.workloadRef.name`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.observedNode`
-// +kubebuilder:printcolumn:name="Period",type=string,JSONPath=`.spec.period`
+// +kubebuilder:printcolumn:name="Schedule",type=string,JSONPath=`.spec.schedule`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Count",type=integer,JSONPath=`.status.checkpointCount`
 // +kubebuilder:printcolumn:name="Last",type=date,JSONPath=`.status.lastCheckpointTime`

@@ -14,7 +14,7 @@
 #
 # The NVIDIA driver install needs a REBOOT. The script detects this: it installs
 # the driver, then EXITS asking you to reboot and re-run. The second run finishes
-# the GPU tooling (cuda-checkpoint, container toolkit, CRIU, CRI-O drop-in,
+# the GPU tooling (cuda-checkpoint, container toolkit, CRIU + cuda_plugin, CRI-O drop-in,
 # kubelet feature gate, GPU C/R dirs).
 #
 #   sudo bash gpu-worker-setup.sh        # 1st run  -> installs driver, asks reboot
@@ -104,11 +104,17 @@ apt-get update -y
 apt-get install -y criu runc || apt-get install -y criu
 criu check || warn "criu check reported issues (often fine for container C/R)."
 criu --version || true
-# CRIU CUDA plugin probe — needed for CRIU to dump a *GPU* container itself.
-echo "  -- CRIU CUDA plugin probe --"
-ls -l /usr/lib/criu/ /usr/libexec/criu/ 2>/dev/null || true
-find / -name '*cuda*plugin*' 2>/dev/null | grep -i criu || \
-  warn "No CRIU CUDA plugin found. GPU-container CRIU dump may need NVIDIA's CRIU cuda plugin; cuda-checkpoint (step2) handles the GPU state in the meantime."
+# CRIUgpu needs the NVIDIA CRIU cuda_plugin ENABLED so CRIU can checkpoint the
+# GPU as part of the container checkpoint. Re-enable it if a previous run disabled
+# it, then verify it is present.
+for d in $(find /usr/lib /usr/libexec /usr/local/lib -name 'cuda_plugin.so.disabled' 2>/dev/null); do
+  mv "$d" "${d%.disabled}" && log "re-enabled ${d%.disabled}"
+done
+if find /usr/lib /usr/libexec /usr/local/lib -name 'cuda_plugin.so' 2>/dev/null | grep -q .; then
+  log "CRIU cuda_plugin present (CRIUgpu enabled)"
+else
+  warn "CRIU cuda_plugin NOT found — CRIUgpu cannot checkpoint the GPU. Install NVIDIA's CRIU cuda plugin or a CRIU build with GPU support."
+fi
 
 # -----------------------------------------------------------------------------
 # 6) CRI-O drop-in: nvidia default runtime (for the device plugin) + runc,
@@ -174,62 +180,20 @@ systemctl is-active --quiet kubelet && log "kubelet active" || warn "kubelet not
 # 8) GPU C/R runtime dirs on the boot disk (no relocation needed @300GB).
 #    These match the hostPath mounts in deploy/daemonset-crio.yaml + sample pod.
 # -----------------------------------------------------------------------------
-log "8/9  GPU C/R host directories"
-mkdir -p /var/lib/gpu-cr/lib /var/lib/gpu-cr/run \
-         /var/lib/gcr-checkpoint /var/lib/kubelet/checkpoints /var/lib/gpu-cr/cuda-req
-chmod 0755 /var/lib/gpu-cr /var/lib/gpu-cr/lib /var/lib/gpu-cr/run /var/lib/gcr-checkpoint /var/lib/gpu-cr/cuda-req
-
+# 8) Checkpoint output directories on the boot disk.
 # -----------------------------------------------------------------------------
-# 9) cuda-checkpoint HOST helper service. The node agent runs in a container
-#    where cuda-checkpoint stack-smashes (glibc ABI mismatch). The agent writes
-#    requests to /var/lib/gpu-cr/cuda-req and this host service executes
-#    cuda-checkpoint natively against the real GPU PID in the container subtree.
-# -----------------------------------------------------------------------------
-log "9/9  cuda-checkpoint host helper service"
-HELPER_SRC="$(dirname "$(readlink -f "$0")")/gpu-cr-cuda-helper.sh"
-if [ -f "$HELPER_SRC" ]; then
-  install -m 0755 "$HELPER_SRC" /usr/local/bin/gpu-cr-cuda-helper.sh
-  cat > /etc/systemd/system/gpu-cr-cuda-helper.service <<UNIT
-[Unit]
-Description=GPU C/R cuda-checkpoint host helper
-After=multi-user.target
+log "8/8  checkpoint directories"
+mkdir -p /var/lib/gcr-checkpoint /var/lib/kubelet/checkpoints
+chmod 0755 /var/lib/gcr-checkpoint
 
-[Service]
-ExecStart=/usr/local/bin/gpu-cr-cuda-helper.sh
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  systemctl daemon-reload
-  systemctl enable --now gpu-cr-cuda-helper.service
-  systemctl is-active --quiet gpu-cr-cuda-helper.service \
-    && log "cuda helper service active" \
-    || warn "cuda helper not active — check: journalctl -u gpu-cr-cuda-helper -n 30"
-else
-  warn "gpu-cr-cuda-helper.sh not found next to this script; copy it to /usr/local/bin and create the service manually."
-fi
-
-# -----------------------------------------------------------------------------
-# 10) Disable the CRIU cuda_plugin (CRIUgpu). GCR drives the GPU itself: the
-#     interceptor handles data buffers and cuda-checkpoint handles control state,
-#     so CRIU must do CPU state ONLY. With the plugin enabled CRIU would try to
-#     checkpoint the GPU too (CRIUgpu) and clash. Disable it by renaming the .so.
-# -----------------------------------------------------------------------------
-log "10/10 disable CRIU cuda_plugin (CRIU does CPU only = GCR)"
-for so in $(find /usr/lib /usr/libexec /usr/local/lib -name 'cuda_plugin.so' 2>/dev/null); do
-  mv "$so" "$so.disabled" && log "disabled $so"
-done
-
-log "DONE. Worker is ready. Summary:"
+log "DONE. Worker is ready (CRIUgpu). Summary:"
 echo "  driver         : $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
 echo "  cuda-checkpoint: $(command -v cuda-checkpoint)"
 echo "  criu           : $(criu --version 2>/dev/null | head -1)"
+echo "  cuda_plugin    : $(find /usr/lib /usr/libexec /usr/local/lib -name 'cuda_plugin.so' 2>/dev/null | head -1 || echo MISSING)"
 echo "  crio           : $(systemctl is-active crio)"
 echo "  kubelet gate   : ContainerCheckpoint=true"
-echo "  cuda helper    : $(systemctl is-active gpu-cr-cuda-helper 2>/dev/null)"
-echo "  dirs           : /var/lib/{gpu-cr,gcr-checkpoint,kubelet/checkpoints}"
+echo "  dirs           : /var/lib/{gcr-checkpoint,kubelet/checkpoints}"
 echo
 echo "Next: from the MASTER, label this node so the agent schedules on it:"
 echo "  kubectl label node <this-node> nvidia.com/gpu.present=true --overwrite"

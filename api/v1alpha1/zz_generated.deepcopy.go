@@ -12,16 +12,16 @@ import (
 )
 
 // DeepCopyInto copies the receiver into out.
-func (in *PodRef) DeepCopyInto(out *PodRef) {
+func (in *WorkloadRef) DeepCopyInto(out *WorkloadRef) {
 	*out = *in
 }
 
 // DeepCopy returns a deep copy.
-func (in *PodRef) DeepCopy() *PodRef {
+func (in *WorkloadRef) DeepCopy() *WorkloadRef {
 	if in == nil {
 		return nil
 	}
-	out := new(PodRef)
+	out := new(WorkloadRef)
 	in.DeepCopyInto(out)
 	return out
 }
@@ -44,7 +44,7 @@ func (in *StorageSpec) DeepCopy() *StorageSpec {
 // DeepCopyInto copies the receiver into out.
 func (in *GPUCheckpointSpec) DeepCopyInto(out *GPUCheckpointSpec) {
 	*out = *in
-	out.PodRef = in.PodRef
+	out.WorkloadRef = in.WorkloadRef
 	out.Storage = in.Storage
 }
 

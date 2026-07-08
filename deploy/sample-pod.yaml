@@ -1,15 +1,17 @@
-# Example GPU Pod wired for GCR selective interception + real data-buffer copy.
+# Plain GPU workload for CRIUgpu checkpointing (no interceptor / no LD_PRELOAD).
+# CRIU + the NVIDIA cuda_plugin checkpoint the GPU transparently.
 apiVersion: v1
 kind: Pod
 metadata:
-  name: vllm-gcr-pod
+  name: cuda-sample-pod
   namespace: default
   labels:
-    app: vllm-gcr
+    app: cuda-sample
 spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
   containers:
     - name: cuda-app
-      # CUDA 12.1 build → compatible with NVIDIA driver 550 (CUDA 12.4).
       image: pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
       command: ["python", "-c"]
       args:
@@ -20,41 +22,6 @@ spec:
           print("GPU tensor allocated:", x.shape, "device:", x.device, flush=True)
           while True:
               time.sleep(3600)
-      env:
-        - name: LD_PRELOAD
-          value: /opt/gpu-cr/libgcr-interceptor.so
-        - name: GCR_HOME
-          value: /opt/gpu-cr
-        - name: GCR_POD_UID
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.uid
-        - name: GCR_CONTROL_DIR
-          value: /var/lib/gpu-cr/run
-        # Big-disk storage where the interceptor writes the data-buffer copy.
-        - name: GCR_DATA_DIR
-          value: /var/lib/gcr-checkpoint
       resources:
         limits:
           nvidia.com/gpu: "1"
-      volumeMounts:
-        - name: gpu-cr-lib
-          mountPath: /opt/gpu-cr
-          readOnly: true
-        - name: gpu-cr-run
-          mountPath: /var/lib/gpu-cr/run
-        - name: gcr-checkpoint
-          mountPath: /var/lib/gcr-checkpoint
-  volumes:
-    - name: gpu-cr-lib
-      hostPath:
-        path: /var/lib/gpu-cr/lib
-        type: Directory
-    - name: gpu-cr-run
-      hostPath:
-        path: /var/lib/gpu-cr/run
-        type: DirectoryOrCreate
-    - name: gcr-checkpoint
-      hostPath:
-        path: /var/lib/gcr-checkpoint
-        type: DirectoryOrCreate

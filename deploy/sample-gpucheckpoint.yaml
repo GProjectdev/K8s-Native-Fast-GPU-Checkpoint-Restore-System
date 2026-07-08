@@ -1,20 +1,16 @@
-# Example GPUCheckpoint CR. Mirrors the "GPUCheckpoint CR example" in the
-# DCN Progress Report, with the added .spec.period field.
+# Checkpoint request for the sample GPU pod.
 apiVersion: gpu-cr.io/v1alpha1
 kind: GPUCheckpoint
 metadata:
-  name: ckpt-vllm-001
+  name: ckpt-sample-001
   namespace: default
 spec:
-  podRef:
-    nodeInfo: gpu-node-1     # node the Pod runs on; the Node Agent on this node acts on the CR
+  workloadRef:
+    kind: Pod
     namespace: default
-    name: vllm-gcr-pod
-    container: vllm
+    name: cuda-sample-pod
+    container: cuda-app
   storage:
-    type: hostPath           # hostPath | nfs | s3
+    type: hostPath
     path: /var/lib/gcr-checkpoint
-  # Checkpoint every 5 minutes (HHMMSS). Use "000000" (or omit) for one-shot.
-  period: "000500"
-  # Take only dirty buffers after the first checkpoint (GCR shadow execution).
-  incremental: true
+  schedule: ""          # one-shot; use "5m", "1h" etc. for periodic

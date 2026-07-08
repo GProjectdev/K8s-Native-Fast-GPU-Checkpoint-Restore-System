@@ -19,15 +19,15 @@ spec:
       subresources:
         status: {}
       additionalPrinterColumns:
-        - name: Pod
+        - name: Workload
           type: string
-          jsonPath: .spec.podRef.name
+          jsonPath: .spec.workloadRef.name
         - name: Node
           type: string
           jsonPath: .status.observedNode
-        - name: Period
+        - name: Schedule
           type: string
-          jsonPath: .spec.period
+          jsonPath: .spec.schedule
         - name: Phase
           type: string
           jsonPath: .status.phase
@@ -44,12 +44,16 @@ spec:
           properties:
             spec:
               type: object
-              required: [podRef, storage]
+              required: [workloadRef, storage]
               properties:
-                podRef:
+                workloadRef:
                   type: object
                   required: [namespace, name]
                   properties:
+                    kind:
+                      type: string
+                      enum: [Pod, Deployment, StatefulSet]
+                      default: Pod
                     namespace:
                       type: string
                     name:
@@ -70,12 +74,11 @@ spec:
                       type: string
                     endpoint:
                       type: string
-                period:
+                schedule:
                   type: string
                   description: >-
-                    Checkpoint interval as a fixed-width HHMMSS string
-                    (e.g. "000500" = every 5 min). Empty or "000000" = one-shot.
-                  pattern: '^[0-9]{6}$'
+                    Checkpoint interval as a Go duration string
+                    (e.g. "30s", "5m", "1h"). Empty = one-shot.
                 incremental:
                   type: boolean
                   default: false
