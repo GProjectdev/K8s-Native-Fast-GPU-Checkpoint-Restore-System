@@ -27,7 +27,7 @@
 #define GCR_IDLE 0
 #define GCR_CKPT 1
 #define GCR_RESTORE 2
-#define GCR_GATING 3   // interceptor -> orchestrator: gate is up, safe to `cuda-checkpoint unlock`
+#define GCR_GATING 3   // interceptor -> orchestrator: gate is up (data remap in progress)
 
 // ---- real dlsym (to call through our own dlsym override without recursion) ----
 static void *(*real_dlsym)(void *, const char *) = NULL;
@@ -223,11 +223,10 @@ static void *watcher(void *arg) {
         } else if (sig == GCR_RESTORE) {
             fprintf(stderr, "[gcr] restore signal received\n"); fflush(stderr);
             if (gcr_vmm_enabled() && gcr_owned_count() > 0) {
-                gcr_gate_set(1);            // (1) block app kernel launches
-                write_signal(GCR_GATING);  // (2) gate is up -> orchestrator may `cuda-checkpoint unlock`
+                gcr_gate_set(1);            // (1) ensure gate up (already captured=1 from freeze under CRIUgpu)
+                write_signal(GCR_GATING);  // (2) breadcrumb: gate is up, data remap starting
                 restore_remap();           // (3) recreate physical + map same VA + H2D
-                                           //     (blocks under 'locked' until the orchestrator unlocks)
-                gcr_gate_set(0);           // (4) data valid -> release app kernel launches
+                gcr_gate_set(0);           // (4) data valid -> release the gated app kernel launches
             }
             write_signal(GCR_IDLE);        // (5) done
             fprintf(stderr, "[gcr] restore ACK sent\n"); fflush(stderr);
@@ -376,6 +375,14 @@ static void resolve_rt_copy(void) {
 static void checkpoint_freeze(void) {
     resolve_rt_copy(); resolve_vmm_real();
     if (!rt_memcpy || !r_cuMemUnmap2 || !r_cuMemRelease2) { fprintf(stderr, "[gcr][engine] freeze: missing fns\n"); fflush(stderr); return; }
+    // CRIUgpu: arm the RESTORE GATE now, before any physical is freed, and leave it set.
+    // CRIU captures gate=1 in process memory, so the *restored* process comes up already
+    // blocked at its first kernel launch until restore_remap() clears it -- under CRIUgpu
+    // there is no cuda-checkpoint 'locked' state to hold the app. This also protects the
+    // SOURCE between freeze and its own remap. g_in_remap lets this engine thread's own
+    // CUDA calls bypass the gate.
+    g_in_remap = 1;
+    gcr_gate_set(1);
     if (rt_setdev) rt_setdev(0);
     if (rt_sync)   rt_sync();
     size_t n = atomic_load(&g_owned_n), done = 0, bytes = 0, fail = 0;
@@ -392,6 +399,7 @@ static void checkpoint_freeze(void) {
     }
     fprintf(stderr, "[gcr][engine] freeze: %zu segs, %zu bytes copied to host, physical released (VA kept); %zu failed\n", done, bytes, fail);
     fflush(stderr);
+    g_in_remap = 0;                     // gate stays armed (captured by CRIU); cleared on restore remap
 }
 
 // STEP 4b — restore remap: recreate physical, map to the SAME VA, copy host->device.
