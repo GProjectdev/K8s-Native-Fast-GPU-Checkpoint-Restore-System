@@ -58,3 +58,35 @@ printf 'tcp-close\next-unix-sk\nfile-locks\n' | sudo tee /etc/criu/default.conf
 ```
 `criu swrk` (spawned by crun during checkpoint) reads this automatically. This is
 baked into `quickstart/scripts/gpu-worker-setup.sh`.
+
+## Phase breakdown (CSV columns)
+Each row now records where the checkpoint time goes:
+
+| column | source | meaning |
+|--------|--------|---------|
+| `total_s` | agent `PHASE_TIMES` | whole pipeline (freeze→kubelet→store→remap) |
+| `freeze_s` | agent | **Selective Interception data checkpoint** (D2H copy + free physical GPU mem). 0 in baseline |
+| `kubelet_s` | agent | CRIUgpu container checkpoint via kubelet API (CRIU dump + cuda_plugin + CRI-O tar) |
+| `cuda_plugin_s` | tar `dump.log` | GPU **control-state** dump inside CRIU (cuda_plugin span) |
+| `cpu_dump_s` | tar `dump.log` | CRIU **CPU memory** dump (= CRIU total − cuda_plugin) |
+| `crio_tar_s` | agent−dump.log | CRI-O tar/write + API overhead (= kubelet_s − CRIU dump) |
+| `store_s` | agent | copy the tar to the CR backend |
+| `remap_s` | agent | interceptor restore (H2D remap) so the source keeps running |
+| `freeze_bytes` | pod log | bytes the interceptor moved GPU→host |
+| `tar_bytes` | agent `stat` | checkpoint tar size |
+
+`cuda_plugin_s`/`cpu_dump_s`/`crio_tar_s`/`tar_bytes` are read from the checkpoint
+tar's `dump.log` via `kubectl exec` into the node-agent pod (it mounts the checkpoint
+dir), so no worker SSH is needed.
+
+### Requires the instrumented node-agent
+`freeze_s/kubelet_s/store_s/remap_s/total_s` come from a `PHASE_TIMES` log line added
+to the agent. Rebuild + redeploy once:
+```bash
+docker build -t docker.io/jeongseungjun/gpu-cr-node-agent:latest .
+docker push docker.io/jeongseungjun/gpu-cr-node-agent:latest
+kubectl -n gpu-cr-system rollout restart ds/gpu-cr-node-agent
+kubectl -n gpu-cr-system rollout status  ds/gpu-cr-node-agent
+```
+(Ensure the DaemonSet's `imagePullPolicy: Always`, or bump an image tag, so the new
+image is actually pulled.)

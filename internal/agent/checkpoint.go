@@ -62,9 +62,15 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 	klog.Infof("checkpoint start: pod=%s/%s container=%s (GCR interception + CRIUgpu)",
 		t.Namespace, t.Pod, t.Container)
 
+	// Per-phase timers so the benchmark can attribute the cost of the Selective
+	// Interception data checkpoint (freeze) vs. the CRIUgpu container checkpoint
+	// (kubelet) vs. store vs. remap. Emitted as a single parseable PHASE_TIMES line.
+	var freezeDur, kubeletDur, storeDur, remapDur time.Duration
+
 	// (1) Selective Interception data checkpoint: interceptor copies GPU data
 	// buffers to host memory and frees the physical GPU memory (keeps the VA).
 	if c.GCRInterception {
+		ph := time.Now()
 		if err := c.Interceptor.Signal(t.PodUID, GCRSignalCkpt); err != nil {
 			return nil, fmt.Errorf("signal data-buffer checkpoint: %w", err)
 		}
@@ -73,28 +79,34 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 				return nil, fmt.Errorf("data-buffer checkpoint did not ack: %w", err)
 			}
 		}
-		klog.V(2).Info("step 1/4 done: GPU data buffers checkpointed to host, physical memory freed")
+		freezeDur = time.Since(ph)
+		klog.V(2).Infof("step 1/4 done: GPU data buffers checkpointed to host, physical memory freed (freeze %s)", freezeDur)
 	}
 
 	// (2) CRIUgpu container checkpoint via the kubelet API. cuda_plugin
 	// checkpoints the remaining GPU control state; CRIU dumps CPU + host data.
 	var produced []string
-	if c.DryRun {
-		produced = []string{c.simulatedArchive(t)}
-	} else {
-		var err error
-		produced, err = c.Kubelet.Checkpoint(ctx, t.Namespace, t.Pod, t.Container)
-		if err != nil {
-			// Best-effort remap so we don't leave the source with freed data.
-			if c.GCRInterception {
-				_ = c.Interceptor.Signal(t.PodUID, GCRSignalRestore)
+	{
+		ph := time.Now()
+		if c.DryRun {
+			produced = []string{c.simulatedArchive(t)}
+		} else {
+			var err error
+			produced, err = c.Kubelet.Checkpoint(ctx, t.Namespace, t.Pod, t.Container)
+			if err != nil {
+				// Best-effort remap so we don't leave the source with freed data.
+				if c.GCRInterception {
+					_ = c.Interceptor.Signal(t.PodUID, GCRSignalRestore)
+				}
+				return nil, fmt.Errorf("kubelet CRIUgpu checkpoint: %w", err)
 			}
-			return nil, fmt.Errorf("kubelet CRIUgpu checkpoint: %w", err)
 		}
+		kubeletDur = time.Since(ph)
 	}
-	klog.V(2).Infof("step 2/4 done: CRIUgpu produced %v", produced)
+	klog.V(2).Infof("step 2/4 done: CRIUgpu produced %v (kubelet %s)", produced, kubeletDur)
 
 	// (3) Store to the backend declared in the CR.
+	phStore := time.Now()
 	stored, err := c.store(t, produced)
 	if err != nil {
 		if c.GCRInterception {
@@ -102,10 +114,12 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 		}
 		return nil, fmt.Errorf("store checkpoint: %w", err)
 	}
-	klog.V(2).Infof("step 3/4 done: stored checkpoint at %s", stored)
+	storeDur = time.Since(phStore)
+	klog.V(2).Infof("step 3/4 done: stored checkpoint at %s (store %s)", stored, storeDur)
 
 	// (4) Remap the data buffers back to the device so the source keeps running.
 	if c.GCRInterception {
+		ph := time.Now()
 		if err := c.Interceptor.Signal(t.PodUID, GCRSignalRestore); err != nil {
 			klog.Errorf("signal data remap failed: %v", err)
 		} else if !c.DryRun {
@@ -113,9 +127,17 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 				klog.Errorf("data remap did not ack: %v", err)
 			}
 		}
+		remapDur = time.Since(ph)
 	}
+	total := time.Since(start)
 	klog.Infof("step 4/4 done: checkpoint stored at %s; source resumed (remapped); took %s",
-		stored, time.Since(start))
+		stored, total)
+	// Machine-parseable phase breakdown (seconds). freeze = Selective Interception
+	// data checkpoint; kubelet = CRIUgpu (cuda_plugin GPU dump + CRIU CPU dump +
+	// CRI-O tar); store = copy tar to backend; remap = interceptor restore.
+	klog.Infof("PHASE_TIMES pod=%s/%s gcr=%t freeze_s=%.3f kubelet_s=%.3f store_s=%.3f remap_s=%.3f total_s=%.3f",
+		t.Namespace, t.Pod, c.GCRInterception,
+		freezeDur.Seconds(), kubeletDur.Seconds(), storeDur.Seconds(), remapDur.Seconds(), total.Seconds())
 	return &Result{ArchivePath: stored, TakenAt: start}, nil
 }
 

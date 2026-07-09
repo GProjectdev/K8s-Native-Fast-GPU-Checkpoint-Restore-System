@@ -83,6 +83,8 @@ EOF
 }
 
 agent_log(){ kubectl -n "$AGENT_NS" logs -l app.kubernetes.io/name=gpu-cr-node-agent --tail="${1:-60}" 2>/dev/null; }
+getnum(){ echo "$1" | grep -oE "$2=[0-9.]+" | head -1 | cut -d= -f2; }
+row(){ local IFS=,; echo "$*" >> "$OUT"; }   # 17 fields, empties allowed
 
 diag(){  # NAME CR  -> dump why it failed
   local name=$1 cr=$2
@@ -144,7 +146,7 @@ run_one(){
   echo "=== [$mode] $fw / $model  ($name) ==="
 
   if ! make_pod "$mode" "$name" "$fw" "$model" | kubectl apply -f - >/dev/null 2>&1; then
-    echo "  deploy failed; skipping"; echo "$mode,$fw,$model,$name,,,,DeployError," >> "$OUT"; cleanup "$cr" "$name"; return 0; fi
+    echo "  deploy failed; skipping"; row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" DeployError ""; cleanup "$cr" "$name"; return 0; fi
 
   local r0; r0=$(now); local ready="" pp=""
   while awk "BEGIN{exit !($(elapsed "$r0")<$TIMEOUT)}"; do
@@ -157,13 +159,13 @@ run_one(){
   if [ -z "$ready" ]; then
     echo "  NOT READY in ${ready_s}s (pod phase=${pp:-unknown})"
     diag "$name" ""
-    echo "$mode,$fw,$model,$name,$ready_s,,,NotReady," >> "$OUT"
+    row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" NotReady ""
     [ "$KEEP_FAILED" = 1 ] || cleanup "$cr" "$name"
     return 0; fi
   echo "  $(kubectl -n "$NS" logs "$name" 2>/dev/null | grep '^READY' | tail -1)  (ready ${ready_s}s)"
 
   if ! sed -e "s|__CR__|$cr|g" -e "s|__NAME__|$name|g" "$here/gpucheckpoint.tmpl.yaml" | kubectl apply -f - >/dev/null 2>&1; then
-    echo "  CR apply failed; skipping"; echo "$mode,$fw,$model,$name,$ready_s,,,CRError," >> "$OUT"; cleanup "$cr" "$name"; return 0; fi
+    echo "  CR apply failed; skipping"; row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" CRError ""; cleanup "$cr" "$name"; return 0; fi
   local c0; c0=$(now); local phase=""
   while awk "BEGIN{exit !($(elapsed "$c0")<$TIMEOUT)}"; do
     phase=$(kubectl -n "$NS" get gpucheckpoint "$cr" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
@@ -173,10 +175,45 @@ run_one(){
   done
   [ -z "$phase" ] && phase="Timeout"
   local wall; wall=$(elapsed "$c0")
-  local took; took=$(agent_log 400 | grep -oE 'took [0-9.]+[a-z]+' | tail -1 | awk '{print $2}')
   local path; path=$(kubectl -n "$NS" get gpucheckpoint "$cr" -o jsonpath='{.status.lastCheckpointPath}' 2>/dev/null || echo "")
-  echo "  phase=$phase  checkpoint_took=${took:-?}  wall=${wall}s  path=$path"
-  echo "$mode,$fw,$model,$name,$ready_s,${took:-},$wall,$phase,$path" >> "$OUT"
+
+  # locate the node-agent that ran this checkpoint (same node as the pod)
+  local node agentpod
+  node=$(kubectl -n "$NS" get pod "$name" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+  agentpod=$(kubectl -n "$AGENT_NS" get pods -l app.kubernetes.io/name=gpu-cr-node-agent -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | awk -v n="$node" '$2==n{print $1; exit}')
+
+  # agent-side phase breakdown for THIS pod (freeze/kubelet/store/remap/total)
+  local pt=""
+  [ -n "$agentpod" ] && pt=$(kubectl -n "$AGENT_NS" logs "$agentpod" --tail=1500 2>/dev/null | grep -F "PHASE_TIMES pod=$NS/$name " | tail -1)
+  [ -z "$pt" ] && pt=$(agent_log 1500 | grep -F "PHASE_TIMES pod=$NS/$name " | tail -1)
+  local freeze_s kubelet_s store_s remap_s total_s
+  freeze_s=$(getnum "$pt" freeze_s); kubelet_s=$(getnum "$pt" kubelet_s)
+  store_s=$(getnum "$pt" store_s);   remap_s=$(getnum "$pt" remap_s); total_s=$(getnum "$pt" total_s)
+
+  # bytes moved by the Selective Interception freeze (from the pod's own interceptor log)
+  local freeze_bytes; freeze_bytes=$(kubectl -n "$NS" logs "$name" 2>/dev/null | grep -oE '[0-9]+ bytes copied to host' | grep -oE '^[0-9]+' | tail -1)
+
+  # intra-CRIUgpu split from the tar's dump.log (agent mounts /var/lib/gcr-checkpoint)
+  local tar_bytes cuda_s criu_s cpu_s crio_tar_s
+  if [ "$phase" = Completed ] && [ -n "$agentpod" ] && [ -n "$path" ]; then
+    tar_bytes=$(kubectl -n "$AGENT_NS" exec "$agentpod" -- sh -c "stat -c %s '$path' 2>/dev/null" 2>/dev/null | tr -dc '0-9')
+    local dl; dl=$(kubectl -n "$AGENT_NS" exec "$agentpod" -- sh -c "tar tf '$path' 2>/dev/null | grep -m1 -E 'dump\.log$'" 2>/dev/null | tr -d '\r')
+    if [ -n "$dl" ]; then
+      local tmp; tmp=$(mktemp)
+      kubectl -n "$AGENT_NS" exec "$agentpod" -- sh -c "tar xOf '$path' '$dl' 2>/dev/null" > "$tmp" 2>/dev/null
+      criu_s=$(awk -F'[()]' '/^\([0-9]/{t=$2} END{if(t!="")printf "%.3f", t}' "$tmp")
+      local cs ce
+      cs=$(grep -m1 cuda_plugin "$tmp" | sed -nE 's/^\(([0-9.]+)\).*/\1/p')
+      ce=$(grep cuda_plugin "$tmp" | tail -1 | sed -nE 's/^\(([0-9.]+)\).*/\1/p')
+      [ -n "$cs" ] && [ -n "$ce" ] && cuda_s=$(awk "BEGIN{printf \"%.3f\", $ce-$cs}")
+      [ -n "$criu_s" ] && [ -n "$cuda_s" ] && cpu_s=$(awk "BEGIN{v=$criu_s-$cuda_s; if(v<0)v=0; printf \"%.3f\", v}")
+      [ -n "$kubelet_s" ] && [ -n "$criu_s" ] && crio_tar_s=$(awk "BEGIN{v=$kubelet_s-$criu_s; if(v<0)v=0; printf \"%.3f\", v}")
+      rm -f "$tmp"
+    fi
+  fi
+
+  echo "  phase=$phase total=${total_s:-$wall}s | freeze=${freeze_s:-0} cuda_plugin=${cuda_s:-?} cpu_dump=${cpu_s:-?} crio_tar=${crio_tar_s:-?} store=${store_s:-0} remap=${remap_s:-0} | tar=${tar_bytes:-?}B path=$path"
+  row "$mode" "$fw" "$model" "$name" "$ready_s" "${total_s:-$wall}" "${freeze_s:-}" "${kubelet_s:-}" "${cuda_s:-}" "${cpu_s:-}" "${crio_tar_s:-}" "${store_s:-}" "${remap_s:-}" "${freeze_bytes:-}" "${tar_bytes:-}" "$phase" "$path"
   if [ "$phase" != "Completed" ]; then
     diag "$name" "$cr"
     [ "$KEEP_FAILED" = 1 ] && { echo "  KEEP_FAILED=1: leaving $name / $cr for inspection"; return 0; }
@@ -186,7 +223,7 @@ run_one(){
 }
 
 preflight
-echo "mode,framework,model,pod,ready_s,checkpoint_took,wall_s,phase,path" > "$OUT"
+echo "mode,framework,model,pod,ready_s,total_s,freeze_s,kubelet_s,cuda_plugin_s,cpu_dump_s,crio_tar_s,store_s,remap_s,freeze_bytes,tar_bytes,phase,path" > "$OUT"
 for mode in $MODES; do
   set_mode "$mode"
   for c in "${CONFIGS[@]}"; do run_one "$mode" $c || echo "  (config errored, continuing)"; done
