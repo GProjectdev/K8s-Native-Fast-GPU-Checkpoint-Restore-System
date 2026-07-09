@@ -13,4 +13,9 @@ spec:
   storage:
     type: hostPath
     path: /var/lib/gcr-checkpoint
+    # For NFS the agent mounts the server export itself at runtime — no DaemonSet
+    # volume needed. Set:
+    #   type: nfs
+    #   endpoint: 10.178.0.15      # NFS server
+    #   path: /mnt/nfs             # exported path on the server
   schedule: ""          # one-shot; use "5m", "1h" etc. for periodic

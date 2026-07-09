@@ -14,7 +14,7 @@ RUN make
 # ---- Runtime image ----
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates nfs-common \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=gobuild /out/node-agent /usr/local/bin/node-agent
 # Interceptor artifact shipped to the node by the agent at startup.
