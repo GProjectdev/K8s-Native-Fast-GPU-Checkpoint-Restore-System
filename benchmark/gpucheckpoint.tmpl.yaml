@@ -1,0 +1,7 @@
+apiVersion: gpu-cr.io/v1alpha1
+kind: GPUCheckpoint
+metadata: { name: __CR__, namespace: default }
+spec:
+  workloadRef: { kind: Pod, namespace: default, name: __NAME__, container: cuda-app }
+  storage: { type: hostPath, path: /var/lib/gcr-checkpoint }
+  schedule: ""      # one-shot
