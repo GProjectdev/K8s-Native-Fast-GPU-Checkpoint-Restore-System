@@ -1,46 +1,49 @@
-# GPU Checkpoint Benchmark — inference services & timing
+# Checkpoint benchmark — our system vs. baseline
 
-Measures **checkpoint time** across different **single-process inference
-frameworks** and **model sizes** on a single A100 40GB worker.
+Measures GPU-checkpoint cost of **our system** (GCR Selective-Interception DATA
+freeze/remap + CRIUgpu control state) against a **pure-CRIUgpu baseline**, across
+several inference frameworks and model sizes.
 
-## Hard constraint: single-process only
-CRIUgpu uses the NVIDIA CRIU `cuda_plugin`, which supports **single-process CUDA
-only** (no CUDA IPC / NCCL / multi-process). So multi-process servers are ruled
-out: **vLLM (V1 uses 2 processes even on 1 GPU), TGI, TorchServe (multi-worker),
-Triton (multi-instance)**. We test single-process inference:
+## Constraint
+CRIUgpu's `cuda_plugin` supports **single-process CUDA only** (no NCCL / CUDA IPC /
+multi-process). So the workloads here are single-process servers. vLLM V1, TGI,
+Triton and multi-worker TorchServe are multi-process and are intentionally excluded.
 
-| Framework | Service | Example models (A100 40GB) |
-|---|---|---|
-| PyTorch + Transformers | in-process load + generate | gpt2, gpt2-large, facebook/opt-1.3b, facebook/opt-6.7b |
-| TensorFlow / Keras | in-process predict | ResNet50, EfficientNetB7 |
-| JAX / Flax | in-process (add a `infer-jax.tmpl.yaml`) | FlaxGPT2 |
+## Modes (`MODES`)
+| mode | agent | pod | what it measures |
+|------|-------|-----|------------------|
+| `gcr` | `GCR_INTERCEPTION=true` | carries the LD_PRELOAD interceptor (`GCR_VMM_ALLOC=1`, control/data mounts) | **our system**: data buffers frozen to host memory by the interceptor, control state by CRIUgpu |
+| `baseline` | `GCR_INTERCEPTION=false` | plain pod, no interceptor | pure CRIUgpu (whole GPU state via cuda_plugin) |
 
-The dominant factor in checkpoint time is the **GPU/host memory footprint**, so
-sweeping model size (esp. in PyTorch) gives the timing curve.
+Same models run under both modes → rows in the CSV are directly comparable.
 
-## Run (from the master)
+## Models (`CONFIGS`, edit in `run.sh`)
+- PyTorch (HF Transformers, fp16): `gpt2`, `gpt2-large`, `facebook/opt-1.3b`, `facebook/opt-6.7b` — sweeps GPU footprint
+- TensorFlow (Keras Applications): `ResNet50`, `EfficientNetB7`
+
+## Run (on the master)
 ```bash
-bash benchmark/run.sh                 # writes bench-results.csv
-# tune: OUT=res.csv TIMEOUT=1200 bash benchmark/run.sh
+bash benchmark/run.sh                                  # gcr then baseline, all models
+MODES=gcr bash benchmark/run.sh                        # only our system
+MODES="gcr baseline" TIMEOUT=1200 OUT=res.csv bash benchmark/run.sh
 ```
-The driver sets the agent to **pure CRIUgpu** (`GCR_INTERCEPTION=false`) so the
-test is framework-agnostic (no in-Pod interceptor). For each config it: deploys
-the pod → waits for `READY` (model loaded + warmed up) → takes a one-shot
-`GPUCheckpoint` → records the checkpoint time.
+The script flips the node-agent's `GCR_INTERCEPTION` per mode automatically and
+restores nothing on exit — set it back yourself if needed.
 
-## Metrics (CSV columns)
-- `ready_s` — pod load + warmup wall time
-- `checkpoint_took` — the agent's internal checkpoint duration (`... took Xs`)
-- `wall_s` — apply-CR → `Completed` wall time (includes reconcile latency)
-- `phase`, `path` — result + produced tar path
-- **tar size**: on the worker, `ls -lh /var/lib/gcr-checkpoint/` (proxy for the
-  CPU+GPU footprint captured).
+## Output — `bench-results.csv`
+`mode, framework, model, pod, ready_s, checkpoint_took, wall_s, phase, path`
+- `checkpoint_took` — from the node-agent log (`took Xs`): the actual checkpoint work
+- `wall_s` — CR-apply → `status.phase=Completed`
+- `phase` — `Completed` / `Failed` / `NotReady` / `Timeout` / `DeployError` / `CRError`
 
-## Prereqs
-Driver 570+, CRIU `cuda_plugin` installed/enabled, the agent DaemonSet running,
-outbound network on the worker (models download from Hugging Face / Keras).
+Compare `gcr` vs `baseline` rows per model for `checkpoint_took` and tar size
+(tars land on the worker: `ls -lh /var/lib/gcr-checkpoint/`).
 
-## GCR variant (optional)
-To compare the GCR data engine vs pure CRIUgpu **for PyTorch**, deploy
-`deploy/sample-pod.yaml` (interceptor + `GCR_VMM_ALLOC=1`) with
-`GCR_INTERCEPTION=true` and checkpoint it — same timing method.
+## Robustness
+`run.sh` never aborts the batch: any failure on one (mode, model) is recorded with
+its `phase` and the run continues to the next.
+
+## Files
+- `run.sh` — driver (composes pods per mode, times checkpoints, writes CSV)
+- `infer-pytorch.py`, `infer-tensorflow.py` — single-process inference servers (print `READY`, then idle)
+- `gpucheckpoint.tmpl.yaml` — one-shot GPUCheckpoint CR template
