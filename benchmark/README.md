@@ -90,3 +90,17 @@ kubectl -n gpu-cr-system rollout status  ds/gpu-cr-node-agent
 ```
 (Ensure the DaemonSet's `imagePullPolicy: Always`, or bump an image tag, so the new
 image is actually pulled.)
+
+
+## Known workload issues (fixed / flagged)
+- **PyTorch `.bin` models need torch>=2.6.** Recent `transformers` blocks `torch.load`
+  of pickle weights on torch<2.6 (`check_torch_load_is_safe`). Models with safetensors
+  (gpt2, gpt2-large) load on any torch; `facebook/opt-*` ship `.bin` and failed on the
+  old 2.4 image. The PyTorch image is now `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime`.
+- **TensorFlow is unsupported by the interceptor (gcr mode).** Baseline TF checkpoints
+  fine, but with the LD_PRELOAD VMM interceptor active TF's BFC allocator crashes at
+  device init. Until the interceptor supports TF, run TF in baseline only:
+  ```bash
+  GCR_SKIP_FW="tensorflow" MODES="gcr baseline" TIMEOUT=1200 bash benchmark/run.sh
+  ```
+  `GCR_SKIP_FW` lists frameworks to skip in gcr mode (recorded as phase `SkippedGCR`).

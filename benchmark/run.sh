@@ -18,6 +18,7 @@ TIMEOUT=${TIMEOUT:-900}
 MODES=${MODES:-"gcr baseline"}
 KEEP_FAILED=${KEEP_FAILED:-0}
 PRECLEAN_GPU=${PRECLEAN_GPU:-0}
+GCR_SKIP_FW=${GCR_SKIP_FW:-}   # frameworks to skip in gcr mode (interceptor unsupported), e.g. "tensorflow"
 here="$(cd "$(dirname "$0")" && pwd)"
 now(){ date +%s.%N; }
 elapsed(){ awk "BEGIN{printf \"%.1f\", $(now)-$1}"; }
@@ -33,7 +34,7 @@ CONFIGS=(
 [ -n "${ONLY:-}" ] && CONFIGS=("$ONLY")   # ONLY="pytorch gpt2" runs a single config
 
 fw_image(){ case $1 in
-  pytorch)    echo "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime";;
+  pytorch)    echo "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime";;
   tensorflow) echo "tensorflow/tensorflow:2.15.0-gpu";;
 esac; }
 fw_pip(){ case $1 in
@@ -144,6 +145,9 @@ run_one(){
   local name="b-${mode}-${fw}-${slug}"; name="${name:0:60}"
   local cr="ckpt-${name}"; cr="${cr:0:62}"
   echo "=== [$mode] $fw / $model  ($name) ==="
+  if [ "$mode" = gcr ]; then case " $GCR_SKIP_FW " in *" $fw "*)
+    echo "  [skip] $fw not supported by the interceptor in gcr mode"
+    row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" SkippedGCR ""; return 0;; esac; fi
 
   if ! make_pod "$mode" "$name" "$fw" "$model" | kubectl apply -f - >/dev/null 2>&1; then
     echo "  deploy failed; skipping"; row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" DeployError ""; cleanup "$cr" "$name"; return 0; fi
