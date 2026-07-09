@@ -30,6 +30,7 @@ CONFIGS=(
   "tensorflow ResNet50"
   "tensorflow EfficientNetB7"
 )
+[ -n "${ONLY:-}" ] && CONFIGS=("$ONLY")   # ONLY="pytorch gpt2" runs a single config
 
 fw_image(){ case $1 in
   pytorch)    echo "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime";;
