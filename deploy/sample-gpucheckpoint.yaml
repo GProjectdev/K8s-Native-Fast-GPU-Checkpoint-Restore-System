@@ -13,9 +13,30 @@ spec:
   storage:
     type: hostPath
     path: /var/lib/gcr-checkpoint
-    # For NFS the agent mounts the server export itself at runtime — no DaemonSet
-    # volume needed. Set:
+    # Storage backends (pick one; the agent honours these directly):
+    #
+    # hostPath : a directory already mounted into the agent DaemonSet.
+    #   type: hostPath
+    #   path: /var/lib/gcr-checkpoint
+    #
+    # mount    : GENERIC file backend — anything mount(8) understands. The agent
+    #            mounts it at runtime (no DaemonSet volume needed). Works for
+    #            NFS, AWS EFS, CIFS/SMB, CephFS, GlusterFS, ...
+    #   type: mount
+    #   fsType: nfs4                # or cifs, ceph, glusterfs, ...
+    #   source: 10.178.0.15:/mnt/nfs
+    #   options: "nfsvers=4,nolock" # mount -o options (optional)
+    #   subPath: gcr                # optional subdir under the mount
+    #   # AWS EFS example:  fsType: nfs4  source: fs-abc123.efs.ap-northeast-3.amazonaws.com:/
+    #
+    # nfs      : shorthand for `mount` with fsType=nfs.
     #   type: nfs
-    #   endpoint: 10.178.0.15      # NFS server
-    #   path: /mnt/nfs             # exported path on the server
+    #   endpoint: 10.178.0.15
+    #   path: /mnt/nfs
+    #
+    # pvc      : CSI-backed claim (e.g. AWS EBS block volumes). Requires the
+    #            checkpoint mover (not yet enabled) — see README.
+    #   type: pvc
+    #   claimName: my-ebs-pvc
+    #   subPath: gcr
   schedule: ""          # one-shot; use "5m", "1h" etc. for periodic

@@ -15,10 +15,12 @@ import (
 	gpucrv1alpha1 "github.com/GProjectdev/K8s-Native-Fast-GPU-Checkpoint-Restore-System/api/v1alpha1"
 )
 
-// nfsMountBase is where the agent mounts NFS backends (type: nfs). Each distinct
-// server:export gets its own subdir. The mount lives in the agent's mount
-// namespace and is (re)created on demand.
-const nfsMountBase = "/var/lib/gpu-cr/nfs"
+// mountBase is where the agent mounts file-based storage backends (nfs, efs,
+// cifs, cephfs, ...) declared via `type: mount` (or the `type: nfs` alias). Each
+// distinct source gets its own subdir; the mount lives in the agent's mount
+// namespace and is (re)created on demand. Block storage (EBS, ...) is not a
+// simple mount — use CSI/PVC for that.
+const mountBase = "/var/lib/gpu-cr/mnt"
 
 // Checkpointer runs the GCR checkpoint pipeline on the local node, using GCR's
 // control/data separation but with the CONTROL STATE handled by CRIUgpu:
@@ -149,11 +151,24 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 	return &Result{ArchivePath: stored, TakenAt: start}, nil
 }
 
-// store copies the produced archive into the CR-defined backend.
+// store copies the produced archive into the CR-defined backend. Backends are
+// dispatched by spec.storage.type; adding a new one is a single case here.
 func (c *Checkpointer) store(t Target, produced []string) (string, error) {
 	switch t.Storage.Type {
+	case gpucrv1alpha1.StorageMount:
+		// Generic file-mount backend: anything mount(8) understands
+		// (nfs, nfs4, efs, cifs, cephfs, glusterfs, ...) via fsType/source/options.
+		return c.storeMount(t, produced, t.Storage.FsType, t.Storage.Source,
+			t.Storage.Options, firstNonEmpty(t.Storage.SubPath, t.Storage.Path))
 	case gpucrv1alpha1.StorageNFS:
-		return c.storeNFS(t, produced)
+		// Convenience alias for a file mount: source = endpoint:path, fsType = nfs.
+		server := strings.TrimSpace(t.Storage.Endpoint)
+		export := strings.TrimSpace(t.Storage.Path)
+		if server == "" || export == "" {
+			return "", fmt.Errorf("nfs storage requires storage.endpoint (server) and storage.path (export)")
+		}
+		return c.storeMount(t, produced, "nfs", server+":"+export,
+			firstNonEmpty(t.Storage.Options, "nfsvers=4,nolock"), t.Storage.SubPath)
 	case gpucrv1alpha1.StorageHostPath, "":
 		// hostPath must be a real mounted volume in the agent, not the container's
 		// ephemeral overlay (otherwise the tar is silently lost on Pod restart).
@@ -163,6 +178,9 @@ func (c *Checkpointer) store(t Target, produced []string) (string, error) {
 			}
 		}
 		return c.storeToDir(t, produced, t.Storage.Path)
+	case gpucrv1alpha1.StoragePVC:
+		return "", fmt.Errorf("storage type pvc (CSI-backed: EBS, EFS, ...) needs the checkpoint mover, which is not yet enabled; " +
+			"for block storage use a PVC referenced as a DaemonSet volume, or use type: mount for file backends")
 	case gpucrv1alpha1.StorageS3:
 		return "", fmt.Errorf("storage type s3 not yet implemented (endpoint=%s, path=%s)",
 			t.Storage.Endpoint, t.Storage.Path)
@@ -171,22 +189,33 @@ func (c *Checkpointer) store(t Target, produced []string) (string, error) {
 	}
 }
 
-// storeNFS mounts the CR's NFS backend (endpoint:path) in the agent's mount
-// namespace on demand and writes the checkpoint tar there. This honours the CR's
-// storage.endpoint/path directly — no DaemonSet volume needs to be pre-declared.
-func (c *Checkpointer) storeNFS(t Target, produced []string) (string, error) {
-	server := strings.TrimSpace(t.Storage.Endpoint)
-	remote := strings.TrimSpace(t.Storage.Path)
-	if server == "" || remote == "" {
-		return "", fmt.Errorf("nfs storage requires spec.storage.endpoint (server) and spec.storage.path (export); got endpoint=%q path=%q", server, remote)
+func firstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
 	}
-	mnt := filepath.Join(nfsMountBase, sanitizeMount(server+"_"+remote))
+	return b
+}
+
+// storeMount mounts a file-based backend (fsType/source/options) in the agent's
+// mount namespace on demand and writes the checkpoint tar under it (+subdir).
+// Covers any filesystem mount(8) supports: nfs, efs, cifs, cephfs, ...
+func (c *Checkpointer) storeMount(t Target, produced []string, fsType, source, options, subdir string) (string, error) {
+	fsType = strings.TrimSpace(fsType)
+	source = strings.TrimSpace(source)
+	if fsType == "" || source == "" {
+		return "", fmt.Errorf("mount storage requires storage.fsType and storage.source (got fsType=%q source=%q)", fsType, source)
+	}
+	mnt := filepath.Join(mountBase, sanitizeMount(fsType+"_"+source))
 	if !c.DryRun {
-		if err := ensureNFSMounted(server, remote, mnt); err != nil {
-			return "", fmt.Errorf("mount nfs %s:%s at %s: %w", server, remote, mnt, err)
+		if err := ensureMounted(fsType, source, options, mnt); err != nil {
+			return "", fmt.Errorf("mount %s %s at %s: %w", fsType, source, mnt, err)
 		}
 	}
-	return c.storeToDir(t, produced, mnt)
+	dir := mnt
+	if sp := strings.Trim(strings.TrimSpace(subdir), "/"); sp != "" {
+		dir = filepath.Join(mnt, sp)
+	}
+	return c.storeToDir(t, produced, dir)
 }
 
 // storeToDir writes (or, in dry-run, simulates) the checkpoint tar into dir.
@@ -212,27 +241,37 @@ func (c *Checkpointer) storeToDir(t Target, produced []string, dir string) (stri
 	return dst, nil
 }
 
-// ensureNFSMounted mounts server:remote at mnt if it is not already a mountpoint.
-// Requires nfs-common (mount.nfs) in the image and a privileged container.
-func ensureNFSMounted(server, remote, mnt string) error {
+// ensureMounted mounts source at mnt with fsType/options if it is not already a
+// mountpoint. Requires the matching mount helper in the image (nfs-common for
+// nfs/efs, cifs-utils for cifs, ...) and a privileged container.
+func ensureMounted(fsType, source, options, mnt string) error {
 	if isMountpoint(mnt) {
 		return nil
 	}
 	if err := os.MkdirAll(mnt, 0o755); err != nil {
 		return err
 	}
-	src := fmt.Sprintf("%s:%s", server, remote)
-	if out, err := exec.Command("mount", "-t", "nfs", "-o", "nfsvers=4,nolock", src, mnt).CombinedOutput(); err != nil {
-		// fall back to version auto-negotiation (NFSv3, etc.)
-		if out2, err2 := exec.Command("mount", "-t", "nfs", src, mnt).CombinedOutput(); err2 != nil {
-			return fmt.Errorf("mount.nfs failed: %v: %s; fallback: %v: %s",
-				err, strings.TrimSpace(string(out)), err2, strings.TrimSpace(string(out2)))
+	args := []string{"-t", fsType}
+	if strings.TrimSpace(options) != "" {
+		args = append(args, "-o", options)
+	}
+	args = append(args, source, mnt)
+	if out, err := exec.Command("mount", args...).CombinedOutput(); err != nil {
+		// for nfs, retry once with auto-negotiated version/options
+		if fsType == "nfs" || fsType == "nfs4" {
+			if out2, err2 := exec.Command("mount", "-t", fsType, source, mnt).CombinedOutput(); err2 != nil {
+				return fmt.Errorf("mount failed: %v: %s; fallback: %v: %s",
+					err, strings.TrimSpace(string(out)), err2, strings.TrimSpace(string(out2)))
+			}
+		} else {
+			return fmt.Errorf("mount -t %s %s %s failed: %v: %s",
+				fsType, source, mnt, err, strings.TrimSpace(string(out)))
 		}
 	}
 	if !isMountpoint(mnt) {
 		return fmt.Errorf("mount reported success but %s is not a mountpoint", mnt)
 	}
-	klog.Infof("mounted NFS %s at %s", src, mnt)
+	klog.Infof("mounted %s %s at %s", fsType, source, mnt)
 	return nil
 }
 
@@ -279,15 +318,14 @@ func ensureRealMount(path string) error {
 		}
 	}
 	if best == "/" && (bestFs == "overlay" || bestFs == "overlayfs") {
-		return fmt.Errorf("storage path %q is not a mounted volume — it maps to the agent's ephemeral container filesystem (overlay %q). Declare a volume for this path in the DaemonSet, or use spec.storage.type: nfs with endpoint+path", p, best)
+		return fmt.Errorf("storage path %q is not a mounted volume — it maps to the agent's ephemeral container filesystem (overlay %q). Declare a volume for this path in the DaemonSet, or use spec.storage.type: mount/nfs", p, best)
 	}
 	return nil
 }
 
 // unescapeMount decodes the octal escapes /proc/mounts uses for spaces/tabs.
 func unescapeMount(s string) string {
-	r := strings.NewReplacer("\040", " ", "\011", "	", "\012", "
-", "\134", "\")
+	r := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
 	return r.Replace(s)
 }
 

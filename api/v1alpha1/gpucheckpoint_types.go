@@ -34,13 +34,15 @@ type WorkloadRef struct {
 }
 
 // StorageType enumerates the supported checkpoint backends.
-// +kubebuilder:validation:Enum=hostPath;nfs;s3
+// +kubebuilder:validation:Enum=hostPath;mount;nfs;pvc;s3
 type StorageType string
 
 const (
-	StorageHostPath StorageType = "hostPath"
-	StorageNFS      StorageType = "nfs"
-	StorageS3       StorageType = "s3"
+	StorageHostPath StorageType = "hostPath" // a volume already mounted into the agent
+	StorageMount    StorageType = "mount"    // generic file mount: fsType+source+options (nfs, efs, cifs, cephfs, ...)
+	StorageNFS      StorageType = "nfs"      // convenience alias for mount with fsType=nfs (endpoint:path)
+	StoragePVC      StorageType = "pvc"      // CSI-backed claim (EBS, EFS, ...) via the checkpoint mover
+	StorageS3       StorageType = "s3"       // object storage
 )
 
 // StorageSpec defines where the checkpoint artifact (Checkpoint.tar) is stored.
@@ -57,6 +59,25 @@ type StorageSpec struct {
 	// Endpoint is an optional backend host/endpoint (e.g. NFS server, S3 host).
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// --- generic file-mount backend (type: mount) ---
+	// FsType is the filesystem type passed to mount(8): nfs, nfs4, cifs, ceph, etc.
+	// +optional
+	FsType string `json:"fsType,omitempty"`
+	// Source is the mount source, e.g. "10.178.0.15:/mnt/nfs", "fs-xxxx.efs.region.amazonaws.com:/", "//host/share".
+	// +optional
+	Source string `json:"source,omitempty"`
+	// Options are comma-separated mount -o options (e.g. "nfsvers=4,nolock").
+	// +optional
+	Options string `json:"options,omitempty"`
+	// SubPath is an optional subdirectory under the backend to write into.
+	// +optional
+	SubPath string `json:"subPath,omitempty"`
+
+	// --- CSI-backed backend (type: pvc) ---
+	// ClaimName is the PersistentVolumeClaim to store into (EBS, EFS, ... via CSI).
+	// +optional
+	ClaimName string `json:"claimName,omitempty"`
 }
 
 // GPUCheckpointSpec defines the desired checkpoint behaviour for a Pod.
