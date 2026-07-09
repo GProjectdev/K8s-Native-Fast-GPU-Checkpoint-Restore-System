@@ -104,3 +104,27 @@ image is actually pulled.)
   GCR_SKIP_FW="tensorflow" MODES="gcr baseline" TIMEOUT=1200 bash benchmark/run.sh
   ```
   `GCR_SKIP_FW` lists frameworks to skip in gcr mode (recorded as phase `SkippedGCR`).
+
+## Choosing the checkpoint storage backend
+`run.sh` builds the GPUCheckpoint CR from `STORAGE_*` env vars (mirrors `spec.storage`),
+so you can benchmark any backend without editing files:
+
+```bash
+# default: node-local hostPath
+bash benchmark/run.sh
+
+# NFS (agent mounts it at runtime; no DaemonSet volume needed)
+STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
+  MODES="gcr baseline" bash benchmark/run.sh
+
+# generic file mount (NFSv4 / EFS / CIFS / CephFS ...)
+STORAGE_TYPE=mount STORAGE_FSTYPE=nfs4 STORAGE_SOURCE=10.178.0.15:/mnt/nfs \
+  STORAGE_OPTIONS=nfsvers=4,nolock STORAGE_SUBPATH=gcr bash benchmark/run.sh
+
+# CSI/PVC (EBS, EFS, ...) — needs the checkpoint mover (pending)
+STORAGE_TYPE=pvc STORAGE_CLAIM=my-ebs-pvc STORAGE_SUBPATH=gcr bash benchmark/run.sh
+```
+The `path` CSV column shows where each tar landed (for nfs/mount it is the agent's
+runtime mountpoint, which is NFS/EFS-backed). Tip: keep the interceptor offload
+(`GCR_DATA_DIR`) on local disk and send only the tar to remote storage, so remote
+I/O doesn't skew the freeze/store timings.

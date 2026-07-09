@@ -1,3 +1,11 @@
+# Reference GPUCheckpoint for the benchmark. run.sh composes this itself from the
+# STORAGE_* env vars, so you don't edit this file to switch backends — set env:
+#
+#   STORAGE_TYPE=hostPath  STORAGE_PATH=/var/lib/gcr-checkpoint          # default
+#   STORAGE_TYPE=nfs   STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr
+#   STORAGE_TYPE=mount STORAGE_FSTYPE=nfs4 STORAGE_SOURCE=10.178.0.15:/mnt/nfs \
+#                      STORAGE_OPTIONS=nfsvers=4,nolock STORAGE_SUBPATH=gcr
+#   STORAGE_TYPE=pvc   STORAGE_CLAIM=my-ebs-pvc STORAGE_SUBPATH=gcr      # (mover pending)
 apiVersion: gpu-cr.io/v1alpha1
 kind: GPUCheckpoint
 metadata: { name: __CR__, namespace: default }

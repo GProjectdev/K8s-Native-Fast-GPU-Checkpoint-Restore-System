@@ -19,6 +19,15 @@ MODES=${MODES:-"gcr baseline"}
 KEEP_FAILED=${KEEP_FAILED:-0}
 PRECLEAN_GPU=${PRECLEAN_GPU:-0}
 GCR_SKIP_FW=${GCR_SKIP_FW:-}   # frameworks to skip in gcr mode (interceptor unsupported), e.g. "tensorflow"
+# --- checkpoint storage backend (mirrors spec.storage) ---
+STORAGE_TYPE=${STORAGE_TYPE:-hostPath}     # hostPath | mount | nfs | pvc
+STORAGE_PATH=${STORAGE_PATH:-/var/lib/gcr-checkpoint}   # hostPath dir, or subdir for mount/pvc
+STORAGE_ENDPOINT=${STORAGE_ENDPOINT:-}     # nfs server
+STORAGE_FSTYPE=${STORAGE_FSTYPE:-}         # mount fsType: nfs4|cifs|ceph|...
+STORAGE_SOURCE=${STORAGE_SOURCE:-}         # mount source, e.g. 10.178.0.15:/mnt/nfs
+STORAGE_OPTIONS=${STORAGE_OPTIONS:-}       # mount -o options
+STORAGE_SUBPATH=${STORAGE_SUBPATH:-}       # subdir under the backend
+STORAGE_CLAIM=${STORAGE_CLAIM:-}           # pvc claimName
 here="$(cd "$(dirname "$0")" && pwd)"
 now(){ date +%s.%N; }
 elapsed(){ awk "BEGIN{printf \"%.1f\", $(now)-$1}"; }
@@ -86,6 +95,26 @@ EOF
 agent_log(){ kubectl -n "$AGENT_NS" logs -l app.kubernetes.io/name=gpu-cr-node-agent --tail="${1:-60}" 2>/dev/null; }
 getnum(){ echo "$1" | grep -oE "$2=[0-9.]+" | head -1 | cut -d= -f2; }
 row(){ local IFS=,; echo "$*" >> "$OUT"; }   # 17 fields, empties allowed
+storage_block(){   # emit the `storage:` mapping for the current STORAGE_* env
+  case "$STORAGE_TYPE" in
+    hostPath|"") echo "  storage: { type: hostPath, path: $STORAGE_PATH }";;
+    nfs)         echo "  storage: { type: nfs, endpoint: $STORAGE_ENDPOINT, path: $STORAGE_PATH${STORAGE_SUBPATH:+, subPath: $STORAGE_SUBPATH} }";;
+    mount)       echo "  storage: { type: mount, fsType: $STORAGE_FSTYPE, source: $STORAGE_SOURCE${STORAGE_OPTIONS:+, options: \"$STORAGE_OPTIONS\"}${STORAGE_SUBPATH:+, subPath: $STORAGE_SUBPATH} }";;
+    pvc)         echo "  storage: { type: pvc, claimName: $STORAGE_CLAIM${STORAGE_SUBPATH:+, subPath: $STORAGE_SUBPATH} }";;
+    *)           echo "  storage: { type: $STORAGE_TYPE, path: $STORAGE_PATH }";;
+  esac
+}
+make_cr(){   # CR YAML for one checkpoint: make_cr <crName> <podName>
+  cat <<EOF
+apiVersion: gpu-cr.io/v1alpha1
+kind: GPUCheckpoint
+metadata: { name: $1, namespace: $NS }
+spec:
+  workloadRef: { kind: Pod, namespace: $NS, name: $2, container: cuda-app }
+$(storage_block)
+  schedule: ""
+EOF
+}
 
 diag(){  # NAME CR  -> dump why it failed
   local name=$1 cr=$2
@@ -168,7 +197,7 @@ run_one(){
     return 0; fi
   echo "  $(kubectl -n "$NS" logs "$name" 2>/dev/null | grep '^READY' | tail -1)  (ready ${ready_s}s)"
 
-  if ! sed -e "s|__CR__|$cr|g" -e "s|__NAME__|$name|g" "$here/gpucheckpoint.tmpl.yaml" | kubectl apply -f - >/dev/null 2>&1; then
+  if ! make_cr "$cr" "$name" | kubectl apply -f - >/dev/null 2>&1; then
     echo "  CR apply failed; skipping"; row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" CRError ""; cleanup "$cr" "$name"; return 0; fi
   local c0; c0=$(now); local phase=""
   while awk "BEGIN{exit !($(elapsed "$c0")<$TIMEOUT)}"; do
@@ -227,10 +256,11 @@ run_one(){
 }
 
 preflight
+echo "[bench] storage: type=$STORAGE_TYPE ${STORAGE_SOURCE:+source=$STORAGE_SOURCE }${STORAGE_ENDPOINT:+endpoint=$STORAGE_ENDPOINT }${STORAGE_CLAIM:+claim=$STORAGE_CLAIM }path=$STORAGE_PATH"
 echo "mode,framework,model,pod,ready_s,total_s,freeze_s,kubelet_s,cuda_plugin_s,cpu_dump_s,crio_tar_s,store_s,remap_s,freeze_bytes,tar_bytes,phase,path" > "$OUT"
 for mode in $MODES; do
   set_mode "$mode"
   for c in "${CONFIGS[@]}"; do run_one "$mode" $c || echo "  (config errored, continuing)"; done
 done
 echo; echo "[bench] results -> $OUT"; column -t -s, "$OUT" 2>/dev/null || cat "$OUT"
-echo "[bench] checkpoint tars are on the worker: ls -lh /var/lib/gcr-checkpoint/"
+echo "[bench] checkpoint tars: storage=$STORAGE_TYPE (see the path column; for hostPath: ls -lh $STORAGE_PATH on the worker)"

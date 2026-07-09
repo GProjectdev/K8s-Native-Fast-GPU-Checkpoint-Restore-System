@@ -51,10 +51,10 @@ type StorageSpec struct {
 	// +kubebuilder:default=hostPath
 	Type StorageType `json:"type"`
 
-	// Path is the directory (or bucket prefix) the checkpoint file is written to.
-	// e.g. /var/lib/gcr-checkpoint
-	// +kubebuilder:validation:Required
-	Path string `json:"path"`
+	// Path is the directory the tar is written to (hostPath), or the subdir under
+	// the backend for mount/pvc. Required for hostPath/nfs; optional otherwise.
+	// +optional
+	Path string `json:"path,omitempty"`
 
 	// Endpoint is an optional backend host/endpoint (e.g. NFS server, S3 host).
 	// +optional

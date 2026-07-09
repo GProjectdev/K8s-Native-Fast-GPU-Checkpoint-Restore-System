@@ -64,7 +64,6 @@ spec:
                       type: string
                 storage:
                   type: object
-                  required: [path]
                   properties:
                     type:
                       type: string
