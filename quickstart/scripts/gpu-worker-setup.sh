@@ -116,6 +116,20 @@ else
   warn "CRIU cuda_plugin NOT found — CRIUgpu cannot checkpoint the GPU. Install NVIDIA's CRIU cuda plugin or a CRIU build with GPU support."
 fi
 
+# CRIU global config, read automatically by `criu swrk` (the CRIU that crun spawns
+# during checkpoint). Real inference workloads keep TCP sockets open (model download
+# keep-alive, clients). Without this CRIU aborts on the first established socket with
+# "Connected TCP socket, consider using --tcp-established option" -> checkpoint -52.
+# tcp-close  : close established TCP connections at dump (restored closed) — the right
+#              choice for idle keep-alive sockets. ext-unix-sk/file-locks help too.
+mkdir -p /etc/criu
+cat > /etc/criu/default.conf <<'CRIUCONF'
+tcp-close
+ext-unix-sk
+file-locks
+CRIUCONF
+log "wrote /etc/criu/default.conf (tcp-close, ext-unix-sk, file-locks)"
+
 # -----------------------------------------------------------------------------
 # 6) CRI-O drop-in: nvidia default runtime (for the device plugin) + runc,
 #    BOTH with monitor_path so conmon is found. Single file, removes older ones.

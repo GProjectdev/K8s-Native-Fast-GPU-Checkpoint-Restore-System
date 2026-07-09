@@ -47,3 +47,14 @@ its `phase` and the run continues to the next.
 - `run.sh` — driver (composes pods per mode, times checkpoints, writes CSV)
 - `infer-pytorch.py`, `infer-tensorflow.py` — single-process inference servers (print `READY`, then idle)
 - `gpucheckpoint.tmpl.yaml` — one-shot GPUCheckpoint CR template
+
+## Worker prerequisite: CRIU TCP handling
+Inference workloads keep TCP sockets open (model-download keep-alive, clients).
+CRIU aborts on the first established socket (`Connected TCP socket ... -52`) unless
+told to close them. On every GPU worker:
+```bash
+sudo mkdir -p /etc/criu
+printf 'tcp-close\next-unix-sk\nfile-locks\n' | sudo tee /etc/criu/default.conf
+```
+`criu swrk` (spawned by crun during checkpoint) reads this automatically. This is
+baked into `quickstart/scripts/gpu-worker-setup.sh`.
