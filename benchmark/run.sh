@@ -222,6 +222,7 @@ run_one(){
   local freeze_s kubelet_s store_s remap_s total_s
   freeze_s=$(getnum "$pt" freeze_s); kubelet_s=$(getnum "$pt" kubelet_s)
   store_s=$(getnum "$pt" store_s);   remap_s=$(getnum "$pt" remap_s); total_s=$(getnum "$pt" total_s)
+  local downtime_s; downtime_s=$(getnum "$pt" downtime_s)
 
   # bytes moved by the Selective Interception freeze (from the pod's own interceptor log)
   local freeze_bytes; freeze_bytes=$(kubectl -n "$NS" logs "$name" 2>/dev/null | grep -oE 'segs, [0-9]+ bytes' | grep -oE '[0-9]+' | tail -1)
@@ -246,7 +247,7 @@ run_one(){
     fi
   fi
 
-  echo "  phase=$phase total=${total_s:-$wall}s | freeze=${freeze_s:-0} cuda_plugin=${cuda_s:-?} cpu_dump=${cpu_s:-?} crio_tar=${crio_tar_s:-?} store=${store_s:-0} remap=${remap_s:-0} | tar=${tar_bytes:-?}B blob=${blob_bytes:-?}B path=$path"
+  echo "  phase=$phase total=${total_s:-$wall}s downtime=${downtime_s:-?}s | freeze=${freeze_s:-0} cuda_plugin=${cuda_s:-?} cpu_dump=${cpu_s:-?} crio_tar=${crio_tar_s:-?} store=${store_s:-0} remap=${remap_s:-0} | tar=${tar_bytes:-?}B blob=${blob_bytes:-?}B path=$path"
   row "$mode" "$fw" "$model" "$name" "$ready_s" "${total_s:-$wall}" "${freeze_s:-}" "${kubelet_s:-}" "${cuda_s:-}" "${cpu_s:-}" "${crio_tar_s:-}" "${store_s:-}" "${remap_s:-}" "${freeze_bytes:-}" "${tar_bytes:-}" "${blob_bytes:-}" "$phase" "$path"
   if [ "$phase" != "Completed" ]; then
     diag "$name" "$cr"

@@ -121,19 +121,9 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 	}
 	klog.V(2).Infof("step 2/4 done: CRIUgpu produced %v (kubelet %s)", produced, kubeletDur)
 
-	// (3) Store to the backend declared in the CR.
-	phStore := time.Now()
-	stored, err := c.store(t, produced)
-	if err != nil {
-		if c.GCRInterception {
-			_ = c.Interceptor.Signal(t.PodUID, GCRSignalRestore)
-		}
-		return nil, fmt.Errorf("store checkpoint: %w", err)
-	}
-	storeDur = time.Since(phStore)
-	klog.V(2).Infof("step 3/4 done: stored checkpoint at %s (store %s)", stored, storeDur)
-
-	// (4) Remap the data buffers back to the device so the source keeps running.
+	// (3) Remap FIRST — resume the workload as soon as the GPU control state is
+	// checkpointed, so the durable store below runs OUTSIDE the workload's downtime
+	// window (GCR: minimize downtime; the slow NFS copy no longer blocks the source).
 	if c.GCRInterception {
 		ph := time.Now()
 		if err := c.Interceptor.Signal(t.PodUID, GCRSignalRestore); err != nil {
@@ -145,15 +135,26 @@ func (c *Checkpointer) Checkpoint(ctx context.Context, t Target) (*Result, error
 		}
 		remapDur = time.Since(ph)
 	}
+	downtime := freezeDur + kubeletDur + remapDur
+	klog.V(2).Infof("step 3/4 done: source resumed (remap %s); workload downtime %s", remapDur, downtime)
+
+	// (4) Store the tar (+ data blob) to the CR backend. The workload is already
+	// running, so this copy is off the critical path (not counted in downtime).
+	phStore := time.Now()
+	stored, err := c.store(t, produced)
+	if err != nil {
+		return nil, fmt.Errorf("store checkpoint (workload already resumed): %w", err)
+	}
+	storeDur = time.Since(phStore)
 	total := time.Since(start)
-	klog.Infof("step 4/4 done: checkpoint stored at %s; source resumed (remapped); took %s",
-		stored, total)
-	// Machine-parseable phase breakdown (seconds). freeze = Selective Interception
-	// data checkpoint; kubelet = CRIUgpu (cuda_plugin GPU dump + CRIU CPU dump +
-	// CRI-O tar); store = copy tar to backend; remap = interceptor restore.
-	klog.Infof("PHASE_TIMES pod=%s/%s gcr=%t freeze_s=%.3f kubelet_s=%.3f store_s=%.3f remap_s=%.3f total_s=%.3f",
+	klog.Infof("step 4/4 done: checkpoint stored at %s; workload downtime %s, store %s, total %s",
+		stored, downtime, storeDur, total)
+	// freeze = Selective Interception data checkpoint; kubelet = CRIUgpu; remap =
+	// interceptor restore; downtime = freeze+kubelet+remap (workload paused); store =
+	// durable copy AFTER resume (off critical path); total = whole call.
+	klog.Infof("PHASE_TIMES pod=%s/%s gcr=%t freeze_s=%.3f kubelet_s=%.3f store_s=%.3f remap_s=%.3f downtime_s=%.3f total_s=%.3f",
 		t.Namespace, t.Pod, c.GCRInterception,
-		freezeDur.Seconds(), kubeletDur.Seconds(), storeDur.Seconds(), remapDur.Seconds(), total.Seconds())
+		freezeDur.Seconds(), kubeletDur.Seconds(), storeDur.Seconds(), remapDur.Seconds(), downtime.Seconds(), total.Seconds())
 	return &Result{ArchivePath: stored, TakenAt: start}, nil
 }
 
