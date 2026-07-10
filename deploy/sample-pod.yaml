@@ -39,7 +39,7 @@ spec:
         - name: GCR_CONTROL_DIR
           value: /var/lib/gpu-cr/run
         - name: GCR_DATA_DIR
-          value: /var/lib/gcr-checkpoint
+          value: /var/lib/gcr-data
       resources:
         limits:
           nvidia.com/gpu: "1"
@@ -51,6 +51,9 @@ spec:
           mountPath: /var/lib/gpu-cr/run
         - name: gcr-checkpoint
           mountPath: /var/lib/gcr-checkpoint
+        # GPU data blobs (Selective Interception offload). Put on tmpfs for RAM speed.
+        - name: gcr-data
+          mountPath: /var/lib/gcr-data
   volumes:
     - name: gpu-cr-lib
       hostPath:
@@ -63,4 +66,8 @@ spec:
     - name: gcr-checkpoint
       hostPath:
         path: /var/lib/gcr-checkpoint
+        type: DirectoryOrCreate
+    - name: gcr-data
+      hostPath:
+        path: /var/lib/gcr-data
         type: DirectoryOrCreate

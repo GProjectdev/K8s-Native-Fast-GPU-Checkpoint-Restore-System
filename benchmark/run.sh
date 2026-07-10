@@ -179,7 +179,7 @@ run_one(){
     row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" SkippedGCR ""; return 0;; esac; fi
 
   if ! make_pod "$mode" "$name" "$fw" "$model" | kubectl apply -f - >/dev/null 2>&1; then
-    echo "  deploy failed; skipping"; row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" DeployError ""; cleanup "$cr" "$name"; return 0; fi
+    echo "  deploy failed; skipping"; row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" "" DeployError ""; cleanup "$cr" "$name"; return 0; fi
 
   local r0; r0=$(now); local ready="" pp=""
   while awk "BEGIN{exit !($(elapsed "$r0")<$TIMEOUT)}"; do
@@ -192,13 +192,13 @@ run_one(){
   if [ -z "$ready" ]; then
     echo "  NOT READY in ${ready_s}s (pod phase=${pp:-unknown})"
     diag "$name" ""
-    row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" NotReady ""
+    row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" "" NotReady ""
     [ "$KEEP_FAILED" = 1 ] || cleanup "$cr" "$name"
     return 0; fi
   echo "  $(kubectl -n "$NS" logs "$name" 2>/dev/null | grep '^READY' | tail -1)  (ready ${ready_s}s)"
 
   if ! make_cr "$cr" "$name" | kubectl apply -f - >/dev/null 2>&1; then
-    echo "  CR apply failed; skipping"; row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" CRError ""; cleanup "$cr" "$name"; return 0; fi
+    echo "  CR apply failed; skipping"; row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" "" CRError ""; cleanup "$cr" "$name"; return 0; fi
   local c0; c0=$(now); local phase=""
   while awk "BEGIN{exit !($(elapsed "$c0")<$TIMEOUT)}"; do
     phase=$(kubectl -n "$NS" get gpucheckpoint "$cr" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
@@ -227,9 +227,10 @@ run_one(){
   local freeze_bytes; freeze_bytes=$(kubectl -n "$NS" logs "$name" 2>/dev/null | grep -oE '[0-9]+ bytes copied to host' | grep -oE '^[0-9]+' | tail -1)
 
   # intra-CRIUgpu split from the tar's dump.log (agent mounts /var/lib/gcr-checkpoint)
-  local tar_bytes cuda_s criu_s cpu_s crio_tar_s
+  local tar_bytes blob_bytes cuda_s criu_s cpu_s crio_tar_s
   if [ "$phase" = Completed ] && [ -n "$agentpod" ] && [ -n "$path" ]; then
     tar_bytes=$(kubectl -n "$AGENT_NS" exec "$agentpod" -- sh -c "stat -c %s '$path' 2>/dev/null" 2>/dev/null | tr -dc '0-9')
+    blob_bytes=$(kubectl -n "$AGENT_NS" exec "$agentpod" -- sh -c "stat -c %s '${path%.tar}.blob' 2>/dev/null" 2>/dev/null | tr -dc '0-9')
     local dl; dl=$(kubectl -n "$AGENT_NS" exec "$agentpod" -- sh -c "tar tf '$path' 2>/dev/null | grep -m1 -E 'dump\.log$'" 2>/dev/null | tr -d '\r')
     if [ -n "$dl" ]; then
       local tmp; tmp=$(mktemp)
@@ -245,8 +246,8 @@ run_one(){
     fi
   fi
 
-  echo "  phase=$phase total=${total_s:-$wall}s | freeze=${freeze_s:-0} cuda_plugin=${cuda_s:-?} cpu_dump=${cpu_s:-?} crio_tar=${crio_tar_s:-?} store=${store_s:-0} remap=${remap_s:-0} | tar=${tar_bytes:-?}B path=$path"
-  row "$mode" "$fw" "$model" "$name" "$ready_s" "${total_s:-$wall}" "${freeze_s:-}" "${kubelet_s:-}" "${cuda_s:-}" "${cpu_s:-}" "${crio_tar_s:-}" "${store_s:-}" "${remap_s:-}" "${freeze_bytes:-}" "${tar_bytes:-}" "$phase" "$path"
+  echo "  phase=$phase total=${total_s:-$wall}s | freeze=${freeze_s:-0} cuda_plugin=${cuda_s:-?} cpu_dump=${cpu_s:-?} crio_tar=${crio_tar_s:-?} store=${store_s:-0} remap=${remap_s:-0} | tar=${tar_bytes:-?}B blob=${blob_bytes:-?}B path=$path"
+  row "$mode" "$fw" "$model" "$name" "$ready_s" "${total_s:-$wall}" "${freeze_s:-}" "${kubelet_s:-}" "${cuda_s:-}" "${cpu_s:-}" "${crio_tar_s:-}" "${store_s:-}" "${remap_s:-}" "${freeze_bytes:-}" "${tar_bytes:-}" "${blob_bytes:-}" "$phase" "$path"
   if [ "$phase" != "Completed" ]; then
     diag "$name" "$cr"
     [ "$KEEP_FAILED" = 1 ] && { echo "  KEEP_FAILED=1: leaving $name / $cr for inspection"; return 0; }
@@ -257,7 +258,7 @@ run_one(){
 
 preflight
 echo "[bench] storage: type=$STORAGE_TYPE ${STORAGE_SOURCE:+source=$STORAGE_SOURCE }${STORAGE_ENDPOINT:+endpoint=$STORAGE_ENDPOINT }${STORAGE_CLAIM:+claim=$STORAGE_CLAIM }path=$STORAGE_PATH"
-echo "mode,framework,model,pod,ready_s,total_s,freeze_s,kubelet_s,cuda_plugin_s,cpu_dump_s,crio_tar_s,store_s,remap_s,freeze_bytes,tar_bytes,phase,path" > "$OUT"
+echo "mode,framework,model,pod,ready_s,total_s,freeze_s,kubelet_s,cuda_plugin_s,cpu_dump_s,crio_tar_s,store_s,remap_s,freeze_bytes,tar_bytes,blob_bytes,phase,path" > "$OUT"
 for mode in $MODES; do
   set_mode "$mode"
   for c in "${CONFIGS[@]}"; do run_one "$mode" $c || echo "  (config errored, continuing)"; done

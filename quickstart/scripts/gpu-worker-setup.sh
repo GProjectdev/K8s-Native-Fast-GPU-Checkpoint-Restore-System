@@ -199,8 +199,10 @@ systemctl is-active --quiet kubelet && log "kubelet active" || warn "kubelet not
 # 8) Checkpoint output directories on the boot disk.
 # -----------------------------------------------------------------------------
 log "8/8  checkpoint + interceptor directories"
-mkdir -p /var/lib/gcr-checkpoint /var/lib/kubelet/checkpoints /var/lib/gpu-cr/lib /var/lib/gpu-cr/run
-chmod 0755 /var/lib/gcr-checkpoint /var/lib/gpu-cr /var/lib/gpu-cr/lib /var/lib/gpu-cr/run
+mkdir -p /var/lib/gcr-checkpoint /var/lib/gcr-data /var/lib/kubelet/checkpoints /var/lib/gpu-cr/lib /var/lib/gpu-cr/run
+chmod 0755 /var/lib/gcr-checkpoint /var/lib/gcr-data /var/lib/gpu-cr /var/lib/gpu-cr/lib /var/lib/gpu-cr/run
+# Optional: put the GPU data-blob dir on tmpfs (RAM) for the GCR fast path:
+#   mountpoint -q /var/lib/gcr-data || mount -t tmpfs -o size=64g tmpfs /var/lib/gcr-data
 
 log "DONE. Worker is ready (CRIUgpu). Summary:"
 echo "  driver         : $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
@@ -209,7 +211,7 @@ echo "  criu           : $(criu --version 2>/dev/null | head -1)"
 echo "  cuda_plugin    : $(find /usr/lib /usr/libexec /usr/local/lib -name 'cuda_plugin.so' 2>/dev/null | head -1 || echo MISSING)"
 echo "  crio           : $(systemctl is-active crio)"
 echo "  kubelet gate   : ContainerCheckpoint=true"
-echo "  dirs           : /var/lib/{gcr-checkpoint,kubelet/checkpoints,gpu-cr/{lib,run}}"
+echo "  dirs           : /var/lib/{gcr-checkpoint,gcr-data,kubelet/checkpoints,gpu-cr/{lib,run}}"
 echo
 echo "Next: from the MASTER, label this node so the agent schedules on it:"
 echo "  kubectl label node <this-node> nvidia.com/gpu.present=true --overwrite"

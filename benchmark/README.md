@@ -128,3 +128,17 @@ The `path` CSV column shows where each tar landed (for nfs/mount it is the agent
 runtime mountpoint, which is NFS/EFS-backed). Tip: keep the interceptor offload
 (`GCR_DATA_DIR`) on local disk and send only the tar to remote storage, so remote
 I/O doesn't skew the freeze/store timings.
+
+## Complete checkpoint = tar + blob (GCR-aligned)
+With the Selective-Interception data engine, a `gcr` checkpoint is TWO files, both
+stored in the backend:
+- `checkpoint-….tar`  — CPU + GPU control state (CRIUgpu)
+- `checkpoint-….blob` — the GPU data buffers (interceptor offload)
+
+The CSV now records both `tar_bytes` and `blob_bytes`. Success looks like:
+- `gcr` **`tar_bytes` << `baseline` `tar_bytes`** (the model left the tar), and
+- `gcr` **`blob_bytes` ≈ model GPU footprint** (the model now lives in the blob).
+
+Both files are needed to restore. The blob dir (`GCR_DATA_DIR` = `/var/lib/gcr-data`)
+is host-visible so the agent persists it next to the tar; put it on tmpfs for RAM speed.
+`GCR_PERSIST_BLOB=false` keeps the blob local only (in-place resume, not restorable).
