@@ -34,9 +34,22 @@ blob, the tar is smaller and the cuda_plugin GPU dump is cheap.
 3. **Bandwidth**: freeze `bytes/time` should approach PCIe (pinned staging) vs the
    old ~1.2 GB/s pageable copy.
 
-## Persistence note
-The blob is the data half of the checkpoint. For **in-place resume** (freeze→checkpoint
-→keep running) it stays in RAM and `remap` reads it — nothing extra needed. For
-**migration / restore-from-scratch**, the blob must be shipped alongside the tar
-(async copy out of RAM); that step is intentionally kept off the checkpoint critical
-path.
+## The checkpoint is tar + blob (both needed to restore)
+IMPORTANT: the `.tar` alone is **not** a complete checkpoint anymore. It holds CPU +
+GPU control state; the GPU **data** lives in `data.blob`. To restore later you need
+**both**.
+
+- The interceptor writes the blob to `GCR_DATA_DIR` on a **host-visible** dir
+  (`/var/lib/gcr-data`, a hostPath the agent also mounts; put it on tmpfs for RAM speed).
+- After CRIUgpu, the agent copies `<GCR_DATA_DIR>/<podUID>/data.blob` next to the tar as
+  `checkpoint-...blob`, so the stored checkpoint = `{...tar, ...blob}` and is complete.
+  Toggle with `GCR_PERSIST_BLOB=false` (then the blob stays local = **in-place resume
+  only**, faster store but not restorable elsewhere).
+
+### Honest tradeoff
+For a **durable** checkpoint the data must be written to storage regardless — so total
+bytes written ≈ baseline (which put the data inside the tar). GCR's win for the durable
+case is the **fast pinned copy** and the option to write the blob **asynchronously**
+(off the critical path) or ship it **RAM→RAM** for live migration — not avoiding the
+write. The dramatic tar/store reduction applies to **in-place resume** and to
+**migration/restore latency**, which is where the paper's numbers come from.

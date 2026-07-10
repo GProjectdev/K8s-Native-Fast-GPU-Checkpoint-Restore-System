@@ -108,6 +108,12 @@ func main() {
 	if os.Getenv("GCR_INTERCEPTION") == "false" {
 		cp.GCRInterception = false
 	}
+	if v := envOr("GCR_HOST_DATA_DIR", ""); v != "" {
+		cp.DataDir = v
+	}
+	if os.Getenv("GCR_PERSIST_BLOB") == "false" {
+		cp.PersistBlob = false // in-place resume only; blob stays local, not shipped
+	}
 	r := &agent.Reconciler{
 		Client:       mgr.GetClient(),
 		NodeName:     nodeName,

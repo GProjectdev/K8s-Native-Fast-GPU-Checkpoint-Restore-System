@@ -62,6 +62,9 @@ spec:
             # Checkpoint output dir — MUST match .spec.storage.path in your CRs.
             - name: gcr-checkpoint
               mountPath: /var/lib/gcr-checkpoint
+            # per-Pod GCR data blobs (GPU data offload); agent persists them beside the tar
+            - name: gcr-data
+              mountPath: /var/lib/gcr-data
           ports:
             - name: metrics
               containerPort: 9290
@@ -87,4 +90,8 @@ spec:
         - name: gcr-checkpoint
           hostPath:
             path: /var/lib/gcr-checkpoint
+            type: DirectoryOrCreate
+        - name: gcr-data
+          hostPath:
+            path: /var/lib/gcr-data
             type: DirectoryOrCreate

@@ -41,6 +41,12 @@ type Checkpointer struct {
 	// GCRInterception gates the Selective Interception data steps (1 and 4). When
 	// false, CRIUgpu alone handles the whole GPU (no control/data separation).
 	GCRInterception bool
+	// DataDir is the node dir where the in-Pod interceptor writes the data blob
+	// (<DataDir>/<podUID>/data.blob). Mounted into the agent so it can persist it.
+	DataDir string
+	// PersistBlob copies that data blob next to the tar so the stored checkpoint is
+	// COMPLETE and restorable (tar = CPU + GPU control state; blob = GPU data).
+	PersistBlob bool
 	// DryRun skips the privileged kubelet checkpoint (dev clusters without GPUs);
 	// the control flow, status updates and storage layout still run end-to-end.
 	DryRun bool
@@ -48,7 +54,7 @@ type Checkpointer struct {
 
 // NewCheckpointer wires the pipeline with sane defaults.
 func NewCheckpointer(im *InterceptorManager, kc *KubeletClient, dryRun bool) *Checkpointer {
-	return &Checkpointer{Interceptor: im, Kubelet: kc, GCRInterception: true, DryRun: dryRun}
+	return &Checkpointer{Interceptor: im, Kubelet: kc, GCRInterception: true, DataDir: "/var/lib/gcr-data", PersistBlob: true, DryRun: dryRun}
 }
 
 // Target describes a resolved checkpoint target on this node.
@@ -237,6 +243,20 @@ func (c *Checkpointer) storeToDir(t Target, produced []string, dir string) (stri
 	}
 	if err := copyFile(produced[0], dst, 0o644); err != nil {
 		return "", err
+	}
+	// Selective Interception keeps the GPU data in an external blob (out of the tar).
+	// Persist it next to the tar so the checkpoint is COMPLETE and restorable.
+	if c.GCRInterception && c.PersistBlob {
+		blobSrc := filepath.Join(c.DataDir, t.PodUID, "data.blob")
+		if fi, err := os.Stat(blobSrc); err == nil && fi.Size() > 0 {
+			blobDst := strings.TrimSuffix(dst, ".tar") + ".blob"
+			if err := copyFile(blobSrc, blobDst, 0o644); err != nil {
+				return "", fmt.Errorf("persist data blob %s: %w", blobSrc, err)
+			}
+			klog.Infof("stored data blob %s (%d bytes) next to %s — checkpoint is complete", blobDst, fi.Size(), dst)
+		} else {
+			klog.Warningf("GCR interception on but no data blob at %s; checkpoint holds control+CPU only and may not restore standalone", blobSrc)
+		}
 	}
 	return dst, nil
 }
