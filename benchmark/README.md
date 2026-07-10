@@ -142,3 +142,38 @@ The CSV now records both `tar_bytes` and `blob_bytes`. Success looks like:
 Both files are needed to restore. The blob dir (`GCR_DATA_DIR` = `/var/lib/gcr-data`)
 is host-visible so the agent persists it next to the tar; put it on tmpfs for RAM speed.
 `GCR_PERSIST_BLOB=false` keeps the blob local only (in-place resume, not restorable).
+
+## Quick single-model check (verify the tar-shrink fix)
+Test one model first — the fastest way to confirm the GCR data engine actually keeps
+the model out of the tar (`ONLY="framework model"` runs a single config).
+
+Prerequisites (once):
+```bash
+# 0) rebuild+redeploy the agent (interceptor munmap + disk cleanup + blob offload)
+docker build -t docker.io/jeongseungjun/gpu-cr-node-agent:latest .   && docker push docker.io/jeongseungjun/gpu-cr-node-agent:latest
+kubectl apply -f deploy/daemonset-crio.yaml
+kubectl -n gpu-cr-system rollout restart ds/gpu-cr-node-agent
+kubectl -n gpu-cr-system rollout status  ds/gpu-cr-node-agent
+
+# 1) free worker disk if a previous run filled it (avoids disk-pressure eviction)
+#    run on each GPU worker:
+#      sudo rm -f  /var/lib/kubelet/checkpoints/*.tar
+#      sudo rm -rf /var/lib/gcr-data/*
+#      df -h /var/lib
+```
+
+Run one model, gcr vs baseline, keeping resources on failure:
+```bash
+# gpt2-large (1.5GB) is big enough to see the shrink; use local storage for the fastest check
+ONLY="pytorch gpt2-large" MODES="gcr baseline" KEEP_FAILED=1 TIMEOUT=1800   bash benchmark/run.sh
+
+# or straight to NFS:
+STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr ONLY="pytorch gpt2-large" MODES="gcr baseline" KEEP_FAILED=1 TIMEOUT=1800   bash benchmark/run.sh
+```
+
+Success = in the CSV, **`gcr` `tar_bytes` is ~model-size smaller than `baseline`**
+(the model left the tar via the external blob), and **`gcr` `freeze_s` is small**
+(RAM offload). If the tar did NOT shrink, CRIU is still dumping the mapping — grab the
+CRIU `dump.log` from inside the tar (see the diagnostics the harness prints on failure).
+
+`ONLY` also works with a single mode, e.g. `MODES=gcr ONLY="pytorch opt-6.7b"`.
