@@ -60,7 +60,7 @@ make_pod(){  # MODE NAME FRAMEWORK MODEL
   if [ "$mode" = gcr ]; then
     env_extra=$'        - { name: GCR_VMM_ALLOC, value: "1" }\n        - { name: LD_PRELOAD, value: /opt/gpu-cr/libgcr-interceptor.so }\n        - { name: GCR_HOME, value: /opt/gpu-cr }\n        - name: GCR_POD_UID\n          valueFrom: { fieldRef: { fieldPath: metadata.uid } }\n        - { name: GCR_CONTROL_DIR, value: /var/lib/gpu-cr/run }\n        - { name: GCR_DATA_DIR, value: /var/lib/gcr-data }'
     vmounts=$'      volumeMounts:\n        - { name: gpu-cr-lib, mountPath: /opt/gpu-cr, readOnly: true }\n        - { name: gpu-cr-run, mountPath: /var/lib/gpu-cr/run }\n        - { name: gcr-checkpoint, mountPath: /var/lib/gcr-checkpoint }\n        - { name: gcr-data, mountPath: /var/lib/gcr-data }'
-    vols=$'  volumes:\n    - name: gpu-cr-lib\n      hostPath: { path: /var/lib/gpu-cr/lib, type: Directory }\n    - name: gpu-cr-run\n      hostPath: { path: /var/lib/gpu-cr/run, type: DirectoryOrCreate }\n    - name: gcr-checkpoint\n      hostPath: { path: /var/lib/gcr-checkpoint, type: DirectoryOrCreate }\n    - name: gcr-data\n      hostPath: { path: /var/lib/gcr-data, type: DirectoryOrCreate }'
+    vols=$'  volumes:\n    - name: gpu-cr-lib\n      hostPath: { path: /var/lib/gpu-cr/lib, type: Directory }\n    - name: gpu-cr-run\n      hostPath: { path: /var/lib/gpu-cr/run, type: DirectoryOrCreate }\n    - name: gcr-checkpoint\n      hostPath: { path: /var/lib/gcr-checkpoint, type: DirectoryOrCreate }\n    - name: gcr-data\n      emptyDir: { medium: Memory }'
   fi
   cat <<EOF
 apiVersion: v1
@@ -224,7 +224,7 @@ run_one(){
   store_s=$(getnum "$pt" store_s);   remap_s=$(getnum "$pt" remap_s); total_s=$(getnum "$pt" total_s)
 
   # bytes moved by the Selective Interception freeze (from the pod's own interceptor log)
-  local freeze_bytes; freeze_bytes=$(kubectl -n "$NS" logs "$name" 2>/dev/null | grep -oE '[0-9]+ bytes copied to host' | grep -oE '^[0-9]+' | tail -1)
+  local freeze_bytes; freeze_bytes=$(kubectl -n "$NS" logs "$name" 2>/dev/null | grep -oE 'segs, [0-9]+ bytes' | grep -oE '[0-9]+' | tail -1)
 
   # intra-CRIUgpu split from the tar's dump.log (agent mounts /var/lib/gcr-checkpoint)
   local tar_bytes blob_bytes cuda_s criu_s cpu_s crio_tar_s

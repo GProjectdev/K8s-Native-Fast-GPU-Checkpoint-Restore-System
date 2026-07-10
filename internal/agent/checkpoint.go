@@ -258,6 +258,13 @@ func (c *Checkpointer) storeToDir(t Target, produced []string, dir string) (stri
 			klog.Warningf("GCR interception on but no data blob at %s; checkpoint holds control+CPU only and may not restore standalone", blobSrc)
 		}
 	}
+	// Free the node-local kubelet checkpoint now that it lives in the backend, so
+	// large tars don't pile up on the boot disk and trigger disk-pressure eviction.
+	if produced[0] != dst {
+		if err := os.Remove(produced[0]); err != nil {
+			klog.V(2).Infof("could not remove local checkpoint %s: %v", produced[0], err)
+		}
+	}
 	return dst, nil
 }
 
