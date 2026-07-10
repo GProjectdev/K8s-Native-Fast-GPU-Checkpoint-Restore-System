@@ -58,9 +58,9 @@ make_pod(){  # MODE NAME FRAMEWORK MODEL
   local pipline=":"; [ -n "$pip" ] && pipline="pip -q install $pip >/dev/null 2>&1 || true"
   local env_extra="" vmounts="" vols=""
   if [ "$mode" = gcr ]; then
-    env_extra=$'        - { name: GCR_VMM_ALLOC, value: "1" }\n        - { name: LD_PRELOAD, value: /opt/gpu-cr/libgcr-interceptor.so }\n        - { name: GCR_HOME, value: /opt/gpu-cr }\n        - name: GCR_POD_UID\n          valueFrom: { fieldRef: { fieldPath: metadata.uid } }\n        - { name: GCR_CONTROL_DIR, value: /var/lib/gpu-cr/run }\n        - { name: GCR_DATA_DIR, value: /var/lib/gcr-checkpoint }'
-    vmounts=$'      volumeMounts:\n        - { name: gpu-cr-lib, mountPath: /opt/gpu-cr, readOnly: true }\n        - { name: gpu-cr-run, mountPath: /var/lib/gpu-cr/run }\n        - { name: gcr-checkpoint, mountPath: /var/lib/gcr-checkpoint }'
-    vols=$'  volumes:\n    - name: gpu-cr-lib\n      hostPath: { path: /var/lib/gpu-cr/lib, type: Directory }\n    - name: gpu-cr-run\n      hostPath: { path: /var/lib/gpu-cr/run, type: DirectoryOrCreate }\n    - name: gcr-checkpoint\n      hostPath: { path: /var/lib/gcr-checkpoint, type: DirectoryOrCreate }'
+    env_extra=$'        - { name: GCR_VMM_ALLOC, value: "1" }\n        - { name: LD_PRELOAD, value: /opt/gpu-cr/libgcr-interceptor.so }\n        - { name: GCR_HOME, value: /opt/gpu-cr }\n        - name: GCR_POD_UID\n          valueFrom: { fieldRef: { fieldPath: metadata.uid } }\n        - { name: GCR_CONTROL_DIR, value: /var/lib/gpu-cr/run }\n        - { name: GCR_DATA_DIR, value: /var/lib/gcr-data }'
+    vmounts=$'      volumeMounts:\n        - { name: gpu-cr-lib, mountPath: /opt/gpu-cr, readOnly: true }\n        - { name: gpu-cr-run, mountPath: /var/lib/gpu-cr/run }\n        - { name: gcr-checkpoint, mountPath: /var/lib/gcr-checkpoint }\n        - { name: gcr-data, mountPath: /var/lib/gcr-data }'
+    vols=$'  volumes:\n    - name: gpu-cr-lib\n      hostPath: { path: /var/lib/gpu-cr/lib, type: Directory }\n    - name: gpu-cr-run\n      hostPath: { path: /var/lib/gpu-cr/run, type: DirectoryOrCreate }\n    - name: gcr-checkpoint\n      hostPath: { path: /var/lib/gcr-checkpoint, type: DirectoryOrCreate }\n    - name: gcr-data\n      emptyDir: { medium: Memory }'
   fi
   cat <<EOF
 apiVersion: v1
