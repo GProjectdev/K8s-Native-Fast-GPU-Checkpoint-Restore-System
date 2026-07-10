@@ -38,6 +38,7 @@ spec:
           args:
             - --kubelet-url=https://127.0.0.1:10250
             - --kubelet-insecure=true
+            - --kubelet-timeout=30m
             - --host-lib-dir=/host/gpu-cr/lib
             - --host-run-dir=/host/gpu-cr/run
             - --interceptor-dist-dir=/opt/gpu-cr-dist

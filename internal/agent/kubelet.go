@@ -41,7 +41,7 @@ type checkpointResponse struct {
 // NewKubeletClient builds a client. If insecure is true the kubelet's serving
 // certificate is not verified (common for self-signed kubelet certs); otherwise
 // caFile must point at the kubelet CA bundle.
-func NewKubeletClient(baseURL, token, caFile string, insecure bool) (*KubeletClient, error) {
+func NewKubeletClient(baseURL, token, caFile string, insecure bool, timeout time.Duration) (*KubeletClient, error) {
 	tlsCfg := &tls.Config{InsecureSkipVerify: insecure} //nolint:gosec // configurable
 	if !insecure && caFile != "" {
 		pem, err := os.ReadFile(caFile)
@@ -58,7 +58,7 @@ func NewKubeletClient(baseURL, token, caFile string, insecure bool) (*KubeletCli
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
 		http: &http.Client{
-			Timeout:   120 * time.Second,
+			Timeout:   timeout,
 			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 		},
 	}, nil

@@ -9,6 +9,7 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -38,6 +39,15 @@ func envOr(key, def string) string {
 	return def
 }
 
+func durOr(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
 func main() {
 	var (
 		metricsAddr  string
@@ -47,8 +57,9 @@ func main() {
 		kubeletInsec bool
 		distDir      string
 		hostLibDir   string
-		hostRunDir   string
-		dryRun       bool
+		hostRunDir     string
+		dryRun         bool
+		kubeletTimeout time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe endpoint")
@@ -59,6 +70,7 @@ func main() {
 	flag.StringVar(&hostLibDir, "host-lib-dir", envOr("HOST_LIB_DIR", "/host/gpu-cr/lib"), "host library dir mounted into the agent (-> /var/lib/gpu-cr/lib on the node)")
 	flag.StringVar(&hostRunDir, "host-run-dir", envOr("HOST_RUN_DIR", "/host/gpu-cr/run"), "host run dir for GCR control channels")
 	flag.BoolVar(&dryRun, "dry-run", envOr("DRY_RUN", "false") == "true", "skip privileged host ops (dev clusters without GPUs)")
+	flag.DurationVar(&kubeletTimeout, "kubelet-timeout", durOr("KUBELET_TIMEOUT", 30*time.Minute), "kubelet checkpoint HTTP client timeout (large GPU checkpoints take minutes)")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -77,7 +89,7 @@ func main() {
 
 	// (2) Kubelet checkpoint API client (bearer token from the SA).
 	token, _ := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-	kc, err := agent.NewKubeletClient(kubeletURL, string(token), kubeletCA, kubeletInsec)
+	kc, err := agent.NewKubeletClient(kubeletURL, string(token), kubeletCA, kubeletInsec, kubeletTimeout)
 	if err != nil {
 		klog.Fatalf("kubelet client: %v", err)
 	}

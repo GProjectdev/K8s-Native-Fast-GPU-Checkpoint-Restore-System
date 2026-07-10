@@ -176,14 +176,16 @@ systemctl is-active --quiet crio && log "CRI-O active" || die "crio failed to st
 # -----------------------------------------------------------------------------
 # 7) kubelet ContainerCheckpoint feature gate (enables the checkpoint API)
 # -----------------------------------------------------------------------------
-log "7/8  kubelet ContainerCheckpoint feature gate"
+log "7/8  kubelet ContainerCheckpoint feature gate + long checkpoint timeout"
 mkdir -p /etc/default
-if ! grep -q 'ContainerCheckpoint' /etc/default/kubelet 2>/dev/null; then
-  if grep -q 'KUBELET_EXTRA_ARGS' /etc/default/kubelet 2>/dev/null; then
-    sed -i 's#KUBELET_EXTRA_ARGS="#KUBELET_EXTRA_ARGS="--feature-gates=ContainerCheckpoint=true #' /etc/default/kubelet
-  else
-    echo 'KUBELET_EXTRA_ARGS="--feature-gates=ContainerCheckpoint=true"' >> /etc/default/kubelet
-  fi
+# ContainerCheckpoint enables the API; runtime-request-timeout must be large because
+# checkpointing a multi-GB GPU model (CRIU dump + cuda_plugin + tar) takes minutes —
+# the 2m default causes "rpc error: DeadlineExceeded" on big models (e.g. opt-6.7b).
+KUBELET_DESIRED='--feature-gates=ContainerCheckpoint=true --runtime-request-timeout=30m'
+if grep -q 'KUBELET_EXTRA_ARGS' /etc/default/kubelet 2>/dev/null; then
+  sed -i "s#^KUBELET_EXTRA_ARGS=.*#KUBELET_EXTRA_ARGS=\"$KUBELET_DESIRED\"#" /etc/default/kubelet
+else
+  echo "KUBELET_EXTRA_ARGS=\"$KUBELET_DESIRED\"" >> /etc/default/kubelet
 fi
 systemctl daemon-reload
 systemctl restart kubelet
