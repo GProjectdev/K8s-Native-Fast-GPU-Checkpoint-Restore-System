@@ -450,7 +450,7 @@ static void checkpoint_freeze(void) {
     // Flush the blob to the backing file, then UNMAP + CLOSE it so that at CRIU-dump
     // time the process holds no mapping/fd to the data — CRIU cannot serialize it into
     // the tar. restore_remap() re-opens + re-maps the file to read the data back.
-    if (g_blob) { msync(g_blob, g_blob_size, MS_SYNC); munmap(g_blob, g_blob_size); g_blob = NULL; g_blob_size = 0; }
+    if (g_blob) { msync(g_blob, g_blob_size, MS_ASYNC); munmap(g_blob, g_blob_size); g_blob = NULL; g_blob_size = 0; }  // ASYNC: don't block freeze on disk writeback (page cache holds the data for remap + the agent's copy)
     if (g_blob_fd >= 0) { close(g_blob_fd); g_blob_fd = -1; }
     fprintf(stderr, "[gcr][engine] freeze: %zu segs, %zu bytes -> external blob (unmapped before checkpoint; excluded from CRIU tar), physical released (VA kept); %zu failed\n", done, bytes, fail);
     fflush(stderr);
