@@ -19,6 +19,7 @@ MODES=${MODES:-"gcr baseline"}
 KEEP_FAILED=${KEEP_FAILED:-0}
 PRECLEAN_GPU=${PRECLEAN_GPU:-0}
 GCR_SKIP_FW=${GCR_SKIP_FW:-}   # frameworks to skip in gcr mode (interceptor unsupported), e.g. "tensorflow"
+RUNS=${RUNS:-3}                # repeats per (mode,config) for median stats
 # --- checkpoint storage backend (mirrors spec.storage) ---
 STORAGE_TYPE=${STORAGE_TYPE:-hostPath}     # hostPath | mount | nfs | pvc
 STORAGE_PATH=${STORAGE_PATH:-/var/lib/gcr-checkpoint}   # hostPath dir, or subdir for mount/pvc
@@ -169,17 +170,17 @@ set_mode(){
 }
 
 run_one(){
-  local mode=$1 fw=$2 model=$3
+  local mode=$1 runidx=$2 fw=$3 model=$4
   local slug; slug=$(echo "$model" | tr '/.:' '---' | tr '[:upper:]' '[:lower:]')
-  local name="b-${mode}-${fw}-${slug}"; name="${name:0:60}"
+  local name="b-${mode}-${fw}-${slug}"; name="${name:0:54}-r${runidx}"
   local cr="ckpt-${name}"; cr="${cr:0:62}"
-  echo "=== [$mode] $fw / $model  ($name) ==="
+  echo "=== [$mode r$runidx] $fw / $model  ($name) ==="
   if [ "$mode" = gcr ]; then case " $GCR_SKIP_FW " in *" $fw "*)
     echo "  [skip] $fw not supported by the interceptor in gcr mode"
     row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" SkippedGCR ""; return 0;; esac; fi
 
   if ! make_pod "$mode" "$name" "$fw" "$model" | kubectl apply -f - >/dev/null 2>&1; then
-    echo "  deploy failed; skipping"; row "$mode" "$fw" "$model" "$name" "" "" "" "" "" "" "" "" "" "" "" "" DeployError ""; cleanup "$cr" "$name"; return 0; fi
+    echo "  deploy failed; skipping"; row "$mode" "$fw" "$model" "$name" "$runidx" "" "" "" "" "" "" "" "" "" "" "" "" "" DeployError ""; cleanup "$cr" "$name"; return 0; fi
 
   local r0; r0=$(now); local ready="" pp=""
   while awk "BEGIN{exit !($(elapsed "$r0")<$TIMEOUT)}"; do
@@ -192,13 +193,13 @@ run_one(){
   if [ -z "$ready" ]; then
     echo "  NOT READY in ${ready_s}s (pod phase=${pp:-unknown})"
     diag "$name" ""
-    row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" "" NotReady ""
+    row "$mode" "$fw" "$model" "$name" "$runidx" "$ready_s" "" "" "" "" "" "" "" "" "" "" "" "" NotReady ""
     [ "$KEEP_FAILED" = 1 ] || cleanup "$cr" "$name"
     return 0; fi
   echo "  $(kubectl -n "$NS" logs "$name" 2>/dev/null | grep '^READY' | tail -1)  (ready ${ready_s}s)"
 
   if ! make_cr "$cr" "$name" | kubectl apply -f - >/dev/null 2>&1; then
-    echo "  CR apply failed; skipping"; row "$mode" "$fw" "$model" "$name" "$ready_s" "" "" "" "" "" "" "" "" "" "" "" CRError ""; cleanup "$cr" "$name"; return 0; fi
+    echo "  CR apply failed; skipping"; row "$mode" "$fw" "$model" "$name" "$runidx" "$ready_s" "" "" "" "" "" "" "" "" "" "" "" "" CRError ""; cleanup "$cr" "$name"; return 0; fi
   local c0; c0=$(now); local phase=""
   while awk "BEGIN{exit !($(elapsed "$c0")<$TIMEOUT)}"; do
     phase=$(kubectl -n "$NS" get gpucheckpoint "$cr" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
@@ -248,7 +249,7 @@ run_one(){
   fi
 
   echo "  phase=$phase total=${total_s:-$wall}s downtime=${downtime_s:-?}s | freeze=${freeze_s:-0} cuda_plugin=${cuda_s:-?} cpu_dump=${cpu_s:-?} crio_tar=${crio_tar_s:-?} store=${store_s:-0} remap=${remap_s:-0} | tar=${tar_bytes:-?}B blob=${blob_bytes:-?}B path=$path"
-  row "$mode" "$fw" "$model" "$name" "$ready_s" "${total_s:-$wall}" "${freeze_s:-}" "${kubelet_s:-}" "${cuda_s:-}" "${cpu_s:-}" "${crio_tar_s:-}" "${store_s:-}" "${remap_s:-}" "${freeze_bytes:-}" "${tar_bytes:-}" "${blob_bytes:-}" "$phase" "$path"
+  row "$mode" "$fw" "$model" "$name" "$runidx" "$ready_s" "${total_s:-$wall}" "${downtime_s:-}" "${freeze_s:-}" "${kubelet_s:-}" "${cuda_s:-}" "${cpu_s:-}" "${crio_tar_s:-}" "${store_s:-}" "${remap_s:-}" "${freeze_bytes:-}" "${tar_bytes:-}" "${blob_bytes:-}" "$phase" "$path"
   if [ "$phase" != "Completed" ]; then
     diag "$name" "$cr"
     [ "$KEEP_FAILED" = 1 ] && { echo "  KEEP_FAILED=1: leaving $name / $cr for inspection"; return 0; }
@@ -259,10 +260,40 @@ run_one(){
 
 preflight
 echo "[bench] storage: type=$STORAGE_TYPE ${STORAGE_SOURCE:+source=$STORAGE_SOURCE }${STORAGE_ENDPOINT:+endpoint=$STORAGE_ENDPOINT }${STORAGE_CLAIM:+claim=$STORAGE_CLAIM }path=$STORAGE_PATH"
-echo "mode,framework,model,pod,ready_s,total_s,freeze_s,kubelet_s,cuda_plugin_s,cpu_dump_s,crio_tar_s,store_s,remap_s,freeze_bytes,tar_bytes,blob_bytes,phase,path" > "$OUT"
+echo "mode,framework,model,pod,run,ready_s,total_s,downtime_s,freeze_s,kubelet_s,cuda_plugin_s,cpu_dump_s,crio_tar_s,store_s,remap_s,freeze_bytes,tar_bytes,blob_bytes,phase,path" > "$OUT"
 for mode in $MODES; do
   set_mode "$mode"
-  for c in "${CONFIGS[@]}"; do run_one "$mode" $c || echo "  (config errored, continuing)"; done
+  for c in "${CONFIGS[@]}"; do
+    for r in $(seq 1 "$RUNS"); do run_one "$mode" "$r" $c || echo "  (config errored, continuing)"; done
+  done
 done
 echo; echo "[bench] results -> $OUT"; column -t -s, "$OUT" 2>/dev/null || cat "$OUT"
+# --- median over repeats (the numbers to report) ---
+python3 - "$OUT" <<'PYEOF'
+import csv, sys, statistics
+from collections import defaultdict
+rows=list(csv.DictReader(open(sys.argv[1])))
+comp=[r for r in rows if r.get("phase")=="Completed"]
+g=defaultdict(list)
+for r in comp: g[(r["mode"],r["framework"],r["model"])].append(r)
+def med(rs,col):
+    v=[float(x[col]) for x in rs if x.get(col) not in ("",None,"?")]
+    return statistics.median(v) if v else float("nan")
+print()
+print("[bench] MEDIAN over completed repeats:")
+print("%-9s %-11s %-18s %9s %8s %8s %8s %3s"%("mode","framework","model","downtime","total","store","tarGB","n"))
+for k in sorted(g):
+    rs=g[k]
+    print("%-9s %-11s %-18s %9.1f %8.1f %8.1f %8.2f %3d"%(
+        k[0],k[1],k[2],med(rs,"downtime_s"),med(rs,"total_s"),med(rs,"store_s"),med(rs,"tar_bytes")/1e9,len(rs)))
+# gcr vs baseline downtime delta per model
+print()
+print("[bench] downtime: baseline - gcr (positive = gcr faster):")
+by=defaultdict(dict)
+for k in g: by[(k[1],k[2])][k[0]]=med(g[k],"downtime_s")
+for mk in sorted(by):
+    d=by[mk]
+    if "gcr" in d and "baseline" in d:
+        print("  %-11s %-18s  gcr %7.1f  baseline %7.1f  ->  %+.1f s"%(mk[0],mk[1],d["gcr"],d["baseline"],d["baseline"]-d["gcr"]))
+PYEOF
 echo "[bench] checkpoint tars: storage=$STORAGE_TYPE (see the path column; for hostPath: ls -lh $STORAGE_PATH on the worker)"
