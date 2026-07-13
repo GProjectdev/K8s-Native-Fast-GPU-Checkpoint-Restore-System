@@ -42,6 +42,11 @@ CONFIGS=(
   "tensorflow EfficientNetB7"
 )
 [ -n "${ONLY:-}" ] && CONFIGS=("$ONLY")   # ONLY="pytorch gpt2" runs a single config
+# FRAMEWORKS="pytorch" -> keep only these frameworks in BOTH modes (fair, same models)
+if [ -n "${FRAMEWORKS:-}" ]; then
+  _f=(); for c in "${CONFIGS[@]}"; do set -- $c; case " $FRAMEWORKS " in *" $1 "*) _f+=("$c");; esac; done
+  CONFIGS=("${_f[@]}")
+fi
 
 fw_image(){ case $1 in
   pytorch)    echo "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime";;
