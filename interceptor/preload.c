@@ -383,17 +383,110 @@ static void resolve_rt_copy(void) {
 static void  *g_blob = NULL;            // mmap base of the external data blob
 static size_t g_blob_size = 0;
 static int    g_blob_fd = -1;
-static void  *g_stage = NULL;           // pinned host staging buffer (fast copies)
+static void  *g_stage = NULL;            // = g_stageA (serial fallback)
+static void  *g_stageA = NULL, *g_stageB = NULL;   // double-buffered pinned staging
 static int  (*rt_hostalloc)(void **, size_t, unsigned int) = NULL;  // cudaHostAlloc
 static int  (*rt_hostfree)(void *) = NULL;                          // cudaFreeHost
+static int  (*rt_memcpy_async)(void *, const void *, size_t, int, void *) = NULL; // cudaMemcpyAsync
+static int  (*rt_stream_create)(void **) = NULL;
+static int  (*rt_stream_destroy)(void *) = NULL;
+static int  (*rt_stream_sync)(void *) = NULL;
+static int  (*rt_event_create)(void **) = NULL;
+static int  (*rt_event_destroy)(void *) = NULL;
+static int  (*rt_event_record)(void *, void *) = NULL;
+static int  (*rt_event_sync)(void *) = NULL;
 
 static void gcr_stage_init(void) {
-    if (g_stage) return;
+    if (g_stageA) return;
     if (!rt_hostalloc) rt_hostalloc = (int(*)(void**,size_t,unsigned int))gcr_next("cudaHostAlloc");
     if (!rt_hostfree)  rt_hostfree  = (int(*)(void*))gcr_next("cudaFreeHost");
-    if (rt_hostalloc && rt_hostalloc(&g_stage, GCR_STAGE_BYTES, 0) != 0) g_stage = NULL;
-    if (!g_stage) { g_stage = malloc(GCR_STAGE_BYTES);   // fallback: pageable (slower)
-        fprintf(stderr, "[gcr][blob] pinned staging unavailable, using pageable\n"); }
+    rt_memcpy_async   = (int(*)(void*,const void*,size_t,int,void*))gcr_next("cudaMemcpyAsync");
+    rt_stream_create  = (int(*)(void**))gcr_next("cudaStreamCreate");
+    rt_stream_destroy = (int(*)(void*))gcr_next("cudaStreamDestroy");
+    rt_stream_sync    = (int(*)(void*))gcr_next("cudaStreamSynchronize");
+    rt_event_create   = (int(*)(void**))gcr_next("cudaEventCreate");
+    rt_event_destroy  = (int(*)(void*))gcr_next("cudaEventDestroy");
+    rt_event_record   = (int(*)(void*,void*))gcr_next("cudaEventRecord");
+    rt_event_sync     = (int(*)(void*))gcr_next("cudaEventSynchronize");
+    if (rt_hostalloc && rt_hostalloc(&g_stageA, GCR_STAGE_BYTES, 0) == 0
+                     && rt_hostalloc(&g_stageB, GCR_STAGE_BYTES, 0) == 0) {
+        /* pinned double buffer -> async overlap path enabled */
+    } else {
+        g_stageA = malloc(GCR_STAGE_BYTES); g_stageB = malloc(GCR_STAGE_BYTES);
+        rt_memcpy_async = NULL;   // no pinned host mem -> async is unsafe; force serial path
+        fprintf(stderr, "[gcr][blob] pinned staging unavailable, using serial pageable copy\n");
+    }
+    g_stage = g_stageA;
+}
+
+// ---- overlapped copy engine (GCR-style: pinned double-buffer + async streams) ----
+#define GCR_COPY_THREADS 4
+typedef struct { char *dst; const char *src; size_t n; } gcr_mc_t;
+static void *gcr_mc_worker(void *a) { gcr_mc_t *m = a; memcpy(m->dst, m->src, m->n); return NULL; }
+static void memcpy_mt(void *dst, const void *src, size_t n) {  // multi-threaded host memcpy
+    if (n < (8UL << 20)) { memcpy(dst, src, n); return; }
+    pthread_t th[GCR_COPY_THREADS]; gcr_mc_t ar[GCR_COPY_THREADS];
+    size_t per = (n + GCR_COPY_THREADS - 1) / GCR_COPY_THREADS; int t = 0;
+    for (int i = 0; i < GCR_COPY_THREADS; i++) {
+        size_t o = (size_t)i * per; if (o >= n) break;
+        size_t c = (n - o < per) ? (n - o) : per;
+        ar[i].dst = (char *)dst + o; ar[i].src = (const char *)src + o; ar[i].n = c;
+        if (pthread_create(&th[t], NULL, gcr_mc_worker, &ar[i]) == 0) t++;
+        else memcpy(ar[i].dst, ar[i].src, ar[i].n);
+    }
+    for (int i = 0; i < t; i++) pthread_join(th[i], NULL);
+}
+
+// Overlap PCIe with the host<->blob memcpy. mode 0 = freeze (D2H: dev->blob),
+// mode 1 = remap (H2D: blob->dev). Returns 0 ok, -1 error, -2 async unavailable.
+static int pipe_copy(int mode) {
+    if (!rt_memcpy_async || !rt_stream_create || !rt_event_create || !rt_event_record
+        || !rt_event_sync || !g_stageA || !g_stageB || !g_blob) return -2;
+    void *stream = NULL;
+    if (rt_stream_create(&stream) != 0 || !stream) return -2;
+    void *ev[2] = { NULL, NULL };
+    if (rt_event_create(&ev[0]) != 0 || rt_event_create(&ev[1]) != 0) {
+        if (rt_stream_destroy) rt_stream_destroy(stream);
+        return -2;
+    }
+    void *bufs[2] = { g_stageA, g_stageB };
+    int prev = -1, j = 0, rc = 0;
+    char *pbuf = NULL, *pblob = NULL; size_t psz = 0;
+    size_t n = atomic_load(&g_owned_n);
+    for (size_t i = 0; i < n; i++) {
+        gcr_owned_t *o = &g_owned[i];
+        int sel = (mode == 0) ? (o->live && !o->frozen) : (o->frozen);
+        if (!sel) continue;
+        size_t rem = o->req, coff = 0;
+        while (rem > 0) {
+            size_t chunk = rem < GCR_STAGE_BYTES ? rem : GCR_STAGE_BYTES;
+            int b = j & 1; char *hbuf = (char *)bufs[b];
+            void *dev = (void *)(uintptr_t)(o->va + coff);
+            char *blob = (char *)g_blob + o->blob_off + coff;
+            if (mode == 0) {
+                if (rt_memcpy_async(hbuf, dev, chunk, 2 /*D2H*/, stream) != 0) { rc = -1; goto fin; }
+            } else {
+                memcpy_mt(hbuf, blob, chunk);
+                if (rt_memcpy_async(dev, hbuf, chunk, 1 /*H2D*/, stream) != 0) { rc = -1; goto fin; }
+            }
+            rt_event_record(ev[b], stream);
+            if (prev >= 0) {
+                rt_event_sync(ev[prev & 1]);
+                if (mode == 0) memcpy_mt(pblob, pbuf, psz);
+            }
+            prev = j; pbuf = hbuf; pblob = blob; psz = chunk;
+            coff += chunk; rem -= chunk; j++;
+        }
+    }
+    if (prev >= 0) {
+        rt_event_sync(ev[prev & 1]);
+        if (mode == 0) memcpy_mt(pblob, pbuf, psz);
+    }
+fin:
+    if (rt_stream_sync) rt_stream_sync(stream);
+    if (rt_event_destroy) { rt_event_destroy(ev[0]); rt_event_destroy(ev[1]); }
+    if (rt_stream_destroy) rt_stream_destroy(stream);
+    return rc;
 }
 
 // map (creating/growing) the external blob file to at least `need` bytes.
@@ -424,35 +517,41 @@ static void checkpoint_freeze(void) {
     gcr_gate_set(1);
     if (rt_setdev) rt_setdev(0);
     if (rt_sync)   rt_sync();
-    // size the external blob: sum of 2MB-rounded sizes of the buffers to offload
+    // size the blob + assign each segment its offset
     size_t n = atomic_load(&g_owned_n), total = 0;
-    for (size_t i = 0; i < n; i++) if (g_owned[i].live && !g_owned[i].frozen) total += ROUND2M(g_owned[i].req);
+    for (size_t i = 0; i < n; i++) if (g_owned[i].live && !g_owned[i].frozen) { g_owned[i].blob_off = total; total += ROUND2M(g_owned[i].req); }
     if (total == 0) { g_in_remap = 0; return; }
     if (blob_map(total) != 0) { fprintf(stderr, "[gcr][engine] freeze: blob map failed; aborting freeze\n"); fflush(stderr); g_in_remap = 0; return; }
-    size_t off = 0, done = 0, bytes = 0, fail = 0;
+    // copy device -> blob, overlapping PCIe with the host copy (fallback: serial)
+    if (pipe_copy(0) == -2) {
+        for (size_t i = 0; i < n; i++) {
+            if (!g_owned[i].live || g_owned[i].frozen) continue;
+            gcr_owned_t *o = &g_owned[i];
+            size_t rem = o->req, coff = 0;
+            while (rem > 0) {
+                size_t chunk = rem < GCR_STAGE_BYTES ? rem : GCR_STAGE_BYTES;
+                if (rt_memcpy(g_stage, (const void *)(uintptr_t)(o->va + coff), chunk, 2 /*D2H*/) != 0) break;
+                memcpy_mt((char *)g_blob + o->blob_off + coff, g_stage, chunk);
+                coff += chunk; rem -= chunk;
+            }
+        }
+    }
+    // release physical GPU memory (keep VA) for every offloaded segment
+    size_t done = 0, bytes = 0;
     for (size_t i = 0; i < n; i++) {
         if (!g_owned[i].live || g_owned[i].frozen) continue;
         gcr_owned_t *o = &g_owned[i];
-        // chunked D2H via pinned staging -> external blob (fast PCIe; nothing retained in-process)
-        size_t rem = o->req, coff = 0; int cpfail = 0;
-        while (rem > 0) {
-            size_t chunk = rem < GCR_STAGE_BYTES ? rem : GCR_STAGE_BYTES;
-            if (rt_memcpy(g_stage, (const void *)(uintptr_t)(o->va + coff), chunk, 2 /*D2H*/) != 0) { cpfail = 1; break; }
-            memcpy((char *)g_blob + off + coff, g_stage, chunk);
-            coff += chunk; rem -= chunk;
-        }
-        if (cpfail) { fail++; continue; }
         r_cuMemUnmap2(o->va, o->padded);
         r_cuMemRelease2(o->handle);
-        o->blob_off = off; o->host_buf = NULL; o->frozen = 1;
-        off += ROUND2M(o->req); done++; bytes += o->req;
+        o->host_buf = NULL; o->frozen = 1;
+        done++; bytes += o->req;
     }
     // Flush the blob to the backing file, then UNMAP + CLOSE it so that at CRIU-dump
     // time the process holds no mapping/fd to the data — CRIU cannot serialize it into
     // the tar. restore_remap() re-opens + re-maps the file to read the data back.
     if (g_blob) { msync(g_blob, g_blob_size, MS_ASYNC); munmap(g_blob, g_blob_size); g_blob = NULL; g_blob_size = 0; }  // ASYNC: don't block freeze on disk writeback (page cache holds the data for remap + the agent's copy)
     if (g_blob_fd >= 0) { close(g_blob_fd); g_blob_fd = -1; }
-    fprintf(stderr, "[gcr][engine] freeze: %zu segs, %zu bytes -> external blob (unmapped before checkpoint; excluded from CRIU tar), physical released (VA kept); %zu failed\n", done, bytes, fail);
+    fprintf(stderr, "[gcr][engine] freeze: %zu segs, %zu bytes -> external blob (overlapped copy; unmapped before checkpoint; excluded from CRIU tar); physical released (VA kept)\n", done, bytes);
     fflush(stderr);
     g_in_remap = 0;                     // gate stays armed (captured by CRIU); cleared on restore remap
 }
@@ -470,28 +569,36 @@ static void restore_remap(void) {
     }
     if (rt_setdev) rt_setdev(0);
     size_t n = atomic_load(&g_owned_n), done = 0, fail = 0;
+    // Phase A: recreate physical + map SAME VA for each frozen segment
     for (size_t i = 0; i < n; i++) {
         if (!g_owned[i].frozen) continue;
         gcr_owned_t *o = &g_owned[i];
         CUmemHandle_t nh = 0;
-        if (r_cuMemCreate(&nh, o->padded, &o->prop, 0) != 0) { fprintf(stderr, "[gcr][engine] remap recreate fail va=0x%llx\n", (unsigned long long)o->va); fail++; continue; }
-        if (r_cuMemMap(o->va, o->padded, 0, nh, 0) != 0) { fprintf(stderr, "[gcr][engine] remap map fail va=0x%llx\n", (unsigned long long)o->va); r_cuMemRelease2(nh); fail++; continue; }
+        if (r_cuMemCreate(&nh, o->padded, &o->prop, 0) != 0) { fprintf(stderr, "[gcr][engine] remap recreate fail va=0x%llx\n", (unsigned long long)o->va); o->frozen = 0; fail++; continue; }
+        if (r_cuMemMap(o->va, o->padded, 0, nh, 0) != 0) { fprintf(stderr, "[gcr][engine] remap map fail va=0x%llx\n", (unsigned long long)o->va); r_cuMemRelease2(nh); o->frozen = 0; fail++; continue; }
         gcr_access_desc_t d; memset(&d, 0, sizeof(d));
         d.location.type = CU_MEM_LOCATION_TYPE_DEVICE; d.location.id = o->prop.location.id;
         d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         r_cuMemSetAccess(o->va, o->padded, &d, 1);
-        // H2D from the external blob via pinned staging
-        size_t rem = o->req, coff = 0;
-        while (rem > 0 && g_blob) {
-            size_t chunk = rem < GCR_STAGE_BYTES ? rem : GCR_STAGE_BYTES;
-            memcpy(g_stage, (char *)g_blob + o->blob_off + coff, chunk);
-            rt_memcpy((void *)(uintptr_t)(o->va + coff), g_stage, chunk, 1 /*H2D*/);
-            coff += chunk; rem -= chunk;
+        o->handle = nh;   // stays frozen=1 -> copied below, cleared in Phase C
+    }
+    // Phase B: copy blob -> device, overlapped async (fallback: serial)
+    if (pipe_copy(1) == -2) {
+        for (size_t i = 0; i < n; i++) {
+            if (!g_owned[i].frozen) continue;
+            gcr_owned_t *o = &g_owned[i];
+            size_t rem = o->req, coff = 0;
+            while (rem > 0 && g_blob) {
+                size_t chunk = rem < GCR_STAGE_BYTES ? rem : GCR_STAGE_BYTES;
+                memcpy_mt(g_stage, (char *)g_blob + o->blob_off + coff, chunk);
+                rt_memcpy((void *)(uintptr_t)(o->va + coff), g_stage, chunk, 1 /*H2D*/);
+                coff += chunk; rem -= chunk;
+            }
         }
-        o->handle = nh; o->frozen = 0;
-        done++;
     }
     if (rt_sync) rt_sync();
+    // Phase C: mark restored
+    for (size_t i = 0; i < n; i++) if (g_owned[i].frozen) { g_owned[i].frozen = 0; done++; }
     fprintf(stderr, "[gcr][engine] remap: %zu segs restored from external blob to same VA + H2D; %zu failed\n", done, fail);
     fflush(stderr);
     g_in_remap = 0;

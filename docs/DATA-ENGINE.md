@@ -18,6 +18,13 @@ This mirrors GCR: their offload target is `/mnt/huge` hugepage shared memory; ou
 `GCR_DATA_DIR`. Put `GCR_DATA_DIR` on **tmpfs (RAM)** for the paper's speed — the
 benchmark mounts it as an `emptyDir{medium: Memory}`.
 
+## Overlapped copy engine (freeze/remap)
+freeze/remap copy GPU<->blob with a GCR-style pipeline: **pinned double-buffer + async
+CUDA streams** overlap the PCIe copy with the host<->blob `memcpy` (multi-threaded), so
+D2H/H2D approach PCIe bandwidth instead of the old serial ~0.7 GB/s. Falls back to a
+serial pageable copy if `cudaHostAlloc`/async symbols are unavailable. Put `GCR_DATA_DIR`
+on **tmpfs** so the host<->blob memcpy is RAM-speed (otherwise disk write-back caps it).
+
 ## Control+CPU path — CRIUgpu
 After freeze, the GPU holds only control state; the agent calls the kubelet
 ContainerCheckpoint API → CRI-O + CRIU + `cuda_plugin` checkpoint the GPU control
