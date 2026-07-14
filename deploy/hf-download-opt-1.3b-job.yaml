@@ -1,0 +1,40 @@
+# One-off Job: download facebook/opt-1.3b into the NFS share so GPU pods can load it
+# locally (no runtime HuggingFace dependency). Runs in a small python container that
+# mounts 10.178.0.15:/mnt/nfs and writes to /mnt/nfs/models/opt-1.3b. No host installs.
+#
+# HF's public Xet CDN currently 403s, so a token is needed:
+#   kubectl create secret generic hf-token -n default --from-literal=token=hf_xxxx
+#   kubectl apply -f deploy/hf-download-opt-1.3b-job.yaml
+#   kubectl logs -f job/hf-download-opt-1-3b
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hf-download-opt-1-3b
+  namespace: default
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: dl
+          image: python:3.11-slim
+          env:
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            - { name: HF_HUB_DOWNLOAD_TIMEOUT, value: "60" }
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token, key: token, optional: true }
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -e
+              pip -q install "huggingface_hub[cli]"
+              echo "downloading facebook/opt-1.3b -> /out/models/opt-1.3b ..."
+              huggingface-cli download facebook/opt-1.3b --local-dir /out/models/opt-1.3b
+              echo "=== done ==="; ls -lh /out/models/opt-1.3b
+          volumeMounts:
+            - { name: nfs, mountPath: /out }
+      volumes:
+        - name: nfs
+          nfs: { server: 10.178.0.15, path: /mnt/nfs }
