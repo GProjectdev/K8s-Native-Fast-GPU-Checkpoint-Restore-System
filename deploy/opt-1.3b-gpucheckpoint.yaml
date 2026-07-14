@@ -1,0 +1,27 @@
+# Checkpoint the opt-1-3b pod with the GCR data engine + CRIUgpu.
+# Produces TWO artifacts in the NFS backend (both required to restore later):
+#   /mnt/nfs/gcr/checkpoint-opt-1-3b_...-<ts>.tar    (CPU + GPU control state, CRIUgpu)
+#   /mnt/nfs/gcr/checkpoint-opt-1-3b_...-<ts>.blob   (GPU data buffers, interceptor)
+#
+# Prereqs:
+#   kubectl -n gpu-cr-system set env ds/gpu-cr-node-agent GCR_INTERCEPTION=true
+#   kubectl apply -f deploy/opt-1.3b-pod.yaml   # wait for READY
+#   kubectl apply -f deploy/opt-1.3b-gpucheckpoint.yaml
+#   kubectl get gpucheckpoint ckpt-opt-1-3b -o jsonpath='{.status.phase} {.status.lastCheckpointPath}{"\n"}'
+apiVersion: gpu-cr.io/v1alpha1
+kind: GPUCheckpoint
+metadata:
+  name: ckpt-opt-1-3b
+  namespace: default
+spec:
+  workloadRef:
+    kind: Pod
+    namespace: default
+    name: opt-1-3b
+    container: cuda-app
+  storage:
+    type: nfs
+    endpoint: 10.178.0.15
+    path: /mnt/nfs
+    subPath: gcr
+  schedule: ""        # one-shot
