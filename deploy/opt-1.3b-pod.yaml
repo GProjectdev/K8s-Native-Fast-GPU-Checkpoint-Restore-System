@@ -20,6 +20,11 @@ spec:
       env:
         - { name: MODEL, value: "facebook/opt-1.3b" }
         - { name: HF_HOME, value: /root/.cache/huggingface }
+        # Download robustness: force the classic (non-Xet) path; the Xet CDN can hang
+        # and leave only metadata downloaded (weights stall). Optionally set HF_TOKEN.
+        - { name: HF_HUB_DISABLE_XET, value: "1" }
+        - { name: HF_HUB_DOWNLOAD_TIMEOUT, value: "60" }
+        # - { name: HF_TOKEN, value: "hf_xxx" }
         # --- GCR interceptor (data engine) ---
         - { name: GCR_VMM_ALLOC, value: "1" }
         - { name: LD_PRELOAD, value: /opt/gpu-cr/libgcr-interceptor.so }
