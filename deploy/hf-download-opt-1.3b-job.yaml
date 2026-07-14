@@ -3,7 +3,7 @@
 # mounts 10.178.0.15:/mnt/nfs and writes to /mnt/nfs/models/opt-1.3b. No host installs.
 #
 # HF's public Xet CDN currently 403s, so a token is needed:
-#   kubectl create secret generic hf-token -n default --from-literal=token=hf_xxxx
+#   kubectl create secret generic hf-token -n default --from-literal=token=hf_xxxx   # only if public 403s
 #   kubectl apply -f deploy/hf-download-opt-1.3b-job.yaml
 #   kubectl logs -f job/hf-download-opt-1-3b
 apiVersion: batch/v1
@@ -29,9 +29,9 @@ spec:
           args:
             - |
               set -e
-              pip -q install "huggingface_hub[cli]"
+              pip -q install -U "huggingface_hub"
               echo "downloading facebook/opt-1.3b -> /out/models/opt-1.3b ..."
-              huggingface-cli download facebook/opt-1.3b --local-dir /out/models/opt-1.3b
+              hf download facebook/opt-1.3b --local-dir /out/models/opt-1.3b
               echo "=== done ==="; ls -lh /out/models/opt-1.3b
           volumeMounts:
             - { name: nfs, mountPath: /out }
