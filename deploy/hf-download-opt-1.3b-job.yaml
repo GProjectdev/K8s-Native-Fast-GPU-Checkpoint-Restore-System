@@ -30,9 +30,17 @@ spec:
             - |
               set -e
               pip -q install -U "huggingface_hub"
-              echo "downloading facebook/opt-1.3b -> /out/models/opt-1.3b ..."
-              hf download facebook/opt-1.3b --local-dir /out/models/opt-1.3b
-              echo "=== done ==="; ls -lh /out/models/opt-1.3b
+              echo "downloading facebook/opt-1.3b (PyTorch files only) -> /out/models/opt-1.3b ..."
+              # Only PyTorch + config + tokenizer; skip tf_model.h5 / flax_model.msgpack
+              # (not needed and currently 403 on HF's Xet CDN). Retry — Xet 403s are flaky.
+              ok=0
+              for i in 1 2 3 4 5 6; do
+                if hf download facebook/opt-1.3b --local-dir /out/models/opt-1.3b                      --include "*.json" "*.bin" "*.txt" "*.model"; then ok=1; break; fi
+                echo "[retry $i] Xet flaked; resuming in 5s..."; sleep 5
+              done
+              echo "=== files ==="; ls -lh /out/models/opt-1.3b
+              test -f /out/models/opt-1.3b/pytorch_model.bin && echo "OK: pytorch_model.bin present" \
+                || { echo "MISSING pytorch_model.bin (ok=$ok)"; exit 1; }
           volumeMounts:
             - { name: nfs, mountPath: /out }
       volumes:
