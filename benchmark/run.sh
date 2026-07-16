@@ -20,6 +20,7 @@ KEEP_FAILED=${KEEP_FAILED:-0}
 PRECLEAN_GPU=${PRECLEAN_GPU:-0}
 GCR_SKIP_FW=${GCR_SKIP_FW:-}   # frameworks to skip in gcr mode (interceptor unsupported), e.g. "tensorflow"
 RUNS=${RUNS:-3}                # repeats per (mode,config) for median stats
+MODELS_NFS=${MODELS_NFS:-}      # "server:/path" e.g. 10.178.0.15:/mnt/nfs/models -> load PyTorch models locally (no HF download)
 # --- checkpoint storage backend (mirrors spec.storage) ---
 STORAGE_TYPE=${STORAGE_TYPE:-hostPath}     # hostPath | mount | nfs | pvc
 STORAGE_PATH=${STORAGE_PATH:-/var/lib/gcr-checkpoint}   # hostPath dir, or subdir for mount/pvc
@@ -68,6 +69,18 @@ make_pod(){  # MODE NAME FRAMEWORK MODEL
     vmounts=$'      volumeMounts:\n        - { name: gpu-cr-lib, mountPath: /opt/gpu-cr, readOnly: true }\n        - { name: gpu-cr-run, mountPath: /var/lib/gpu-cr/run }\n        - { name: gcr-checkpoint, mountPath: /var/lib/gcr-checkpoint }\n        - { name: gcr-data, mountPath: /var/lib/gcr-data }'
     vols=$'  volumes:\n    - name: gpu-cr-lib\n      hostPath: { path: /var/lib/gpu-cr/lib, type: Directory }\n    - name: gpu-cr-run\n      hostPath: { path: /var/lib/gpu-cr/run, type: DirectoryOrCreate }\n    - name: gcr-checkpoint\n      hostPath: { path: /var/lib/gcr-checkpoint, type: DirectoryOrCreate }\n    - name: gcr-data\n      hostPath: { path: /var/lib/gcr-data, type: DirectoryOrCreate }'
   fi
+  # Local model cache: mount the NFS models dir and load PyTorch models from a local
+  # path (offline) instead of downloading from HuggingFace at runtime.
+  local model_val="$model" cache_env=""
+  if [ -n "$MODELS_NFS" ] && [ "$fw" = pytorch ]; then
+    model_val="/models/$model"
+    cache_env=$'\n        - { name: HF_HUB_OFFLINE, value: "1" }\n        - { name: TRANSFORMERS_OFFLINE, value: "1" }\n        - { name: HF_HUB_DISABLE_XET, value: "1" }'
+    local msrv="${MODELS_NFS%%:*}" mspath="${MODELS_NFS#*:}"
+    local mmount='        - { name: models, mountPath: /models, readOnly: true }'
+    local mvol="    - name: models"$'\n'"      nfs: { server: $msrv, path: $mspath }"
+    if [ -n "$vmounts" ]; then vmounts="$vmounts"$'\n'"$mmount"; else vmounts=$'      volumeMounts:\n'"$mmount"; fi
+    if [ -n "$vols" ];    then vols="$vols"$'\n'"$mvol";       else vols=$'  volumes:\n'"$mvol"; fi
+  fi
   cat <<EOF
 apiVersion: v1
 kind: Pod
@@ -82,8 +95,8 @@ spec:
     - name: cuda-app
       image: $image
       env:
-        - { name: MODEL, value: "$model" }
-        - { name: HF_HOME, value: /root/.cache/huggingface }
+        - { name: MODEL, value: "$model_val" }
+        - { name: HF_HOME, value: /root/.cache/huggingface }$cache_env
 $env_extra
       command: ["bash","-lc"]
       args:
@@ -97,7 +110,6 @@ $vmounts
 $vols
 EOF
 }
-
 agent_log(){ kubectl -n "$AGENT_NS" logs -l app.kubernetes.io/name=gpu-cr-node-agent --tail="${1:-60}" 2>/dev/null; }
 getnum(){ echo "$1" | grep -oE "$2=[0-9.]+" | head -1 | cut -d= -f2; }
 row(){ local IFS=,; echo "$*" >> "$OUT"; }   # 17 fields, empties allowed

@@ -1,0 +1,56 @@
+# Pre-download the benchmark PyTorch models into the NFS share so run.sh can load them
+# locally (MODELS_NFS=...), avoiding HuggingFace's flaky Xet CDN at benchmark time.
+# Writes to 10.178.0.15:/mnt/nfs/models/<model-id>.
+#
+#   # optional (public Xet often 403s): kubectl create secret generic hf-token -n default --from-literal=token=hf_xxx
+#   kubectl apply -f benchmark/download-models-job.yaml
+#   kubectl logs -f job/hf-download-bench-models
+#   # then run the benchmark against the cache:
+#   MODELS_NFS=10.178.0.15:/mnt/nfs/models FRAMEWORKS=pytorch MODES="gcr baseline" RUNS=3 \
+#     STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
+#     bash benchmark/run.sh
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hf-download-bench-models
+  namespace: default
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: dl
+          image: python:3.11-slim
+          env:
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            - { name: HF_HUB_DOWNLOAD_TIMEOUT, value: "60" }
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+            - { name: MODELS, value: "gpt2 gpt2-large facebook/opt-1.3b facebook/opt-6.7b" }
+          command: ["bash","-lc"]
+          args:
+            - |
+              set -e
+              pip -q install -U "huggingface_hub"
+              for m in $MODELS; do
+                echo "=== downloading $m -> /out/models/$m ==="
+                # only PyTorch + config + tokenizer; skip tf_model.h5 / flax (403 on Xet).
+                # resume + retry — Xet public 403s are intermittent.
+                for i in 1 2 3 4 5 6 7 8; do
+                  hf download "$m" --local-dir "/out/models/$m" \
+                    --include "*.json" "*.bin" "*.safetensors" "*.txt" "*.model" && break
+                  echo "[retry $i] $m (Xet flaked); resuming in 5s..."; sleep 5
+                done
+                if find "/out/models/$m" -maxdepth 1 \( -name '*.bin' -o -name '*.safetensors' \) | grep -q .; then
+                  echo "OK $m"
+                else
+                  echo "FAIL $m: no weights downloaded"; exit 1
+                fi
+              done
+              echo "=== all models cached ==="; du -sh /out/models/* 2>/dev/null
+          volumeMounts:
+            - { name: nfs, mountPath: /out }
+      volumes:
+        - name: nfs
+          nfs: { server: 10.178.0.15, path: /mnt/nfs }

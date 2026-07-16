@@ -177,3 +177,24 @@ Success = in the CSV, **`gcr` `tar_bytes` is ~model-size smaller than `baseline`
 CRIU `dump.log` from inside the tar (see the diagnostics the harness prints on failure).
 
 `ONLY` also works with a single mode, e.g. `MODES=gcr ONLY="pytorch opt-6.7b"`.
+
+## Offline models (avoid HuggingFace download failures)
+HF's Xet CDN intermittently 403s, stalling model downloads at benchmark time. Pre-cache
+the PyTorch models into the NFS share once, then load them locally:
+
+```bash
+# (optional, if public Xet 403s) create an HF token secret:
+kubectl create secret generic hf-token -n default --from-literal=token=hf_xxx
+
+# 1) download gpt2, gpt2-large, opt-1.3b, opt-6.7b into 10.178.0.15:/mnt/nfs/models/<id>
+kubectl apply -f benchmark/download-models-job.yaml
+kubectl logs -f job/hf-download-bench-models      # wait for "all models cached"
+
+# 2) run the benchmark against the cache (MODELS_NFS -> load from /models/<id> offline)
+MODELS_NFS=10.178.0.15:/mnt/nfs/models FRAMEWORKS=pytorch MODES="gcr baseline" RUNS=3 \
+  STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
+  bash benchmark/run.sh
+```
+`MODELS_NFS` mounts the NFS models dir into each PyTorch pod and sets `MODEL=/models/<id>`
+with `HF_HUB_OFFLINE=1`/`TRANSFORMERS_OFFLINE=1` — no runtime HuggingFace access.
+(TensorFlow models are unaffected; they use keras.applications, not HF.)
