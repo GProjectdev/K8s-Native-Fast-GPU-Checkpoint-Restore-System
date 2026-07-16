@@ -54,7 +54,7 @@ fw_image(){ case $1 in
   tensorflow) echo "tensorflow/tensorflow:2.15.0-gpu";;
 esac; }
 fw_pip(){ case $1 in
-  pytorch)    echo '"transformers>=4.44" accelerate sentencepiece';;
+  pytorch)    echo '"transformers>=4.44" accelerate sentencepiece tiktoken protobuf';;
   tensorflow) echo '';;
 esac; }
 
@@ -62,7 +62,7 @@ make_pod(){  # MODE NAME FRAMEWORK MODEL
   local mode=$1 name=$2 fw=$3 model=$4
   local image pip pyb64; image=$(fw_image "$fw"); pip=$(fw_pip "$fw")
   pyb64=$(base64 -w0 "$here/infer-$fw.py")
-  local pipline=":"; [ -n "$pip" ] && pipline="pip -q install $pip >/dev/null 2>&1 || true"
+  local pipline=":"; [ -n "$pip" ] && pipline="pip -q install $pip"
   local env_extra="" vmounts="" vols=""
   if [ "$mode" = gcr ]; then
     env_extra=$'        - { name: GCR_VMM_ALLOC, value: "1" }\n        - { name: LD_PRELOAD, value: /opt/gpu-cr/libgcr-interceptor.so }\n        - { name: GCR_HOME, value: /opt/gpu-cr }\n        - name: GCR_POD_UID\n          valueFrom: { fieldRef: { fieldPath: metadata.uid } }\n        - { name: GCR_CONTROL_DIR, value: /var/lib/gpu-cr/run }\n        - { name: GCR_DATA_DIR, value: /var/lib/gcr-data }'
