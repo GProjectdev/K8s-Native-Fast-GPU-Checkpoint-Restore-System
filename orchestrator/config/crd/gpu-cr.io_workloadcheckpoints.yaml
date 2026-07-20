@@ -1,0 +1,122 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: workloadcheckpoints.gpu-cr.io
+spec:
+  group: gpu-cr.io
+  names:
+    kind: WorkloadCheckpoint
+    listKind: WorkloadCheckpointList
+    plural: workloadcheckpoints
+    singular: workloadcheckpoint
+    shortNames:
+      - wckpt
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Kind
+          type: string
+          jsonPath: .spec.workloadRef.kind
+        - name: Workload
+          type: string
+          jsonPath: .spec.workloadRef.name
+        - name: Action
+          type: string
+          jsonPath: .spec.action
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Total
+          type: integer
+          jsonPath: .status.total
+        - name: Done
+          type: integer
+          jsonPath: .status.completed
+        - name: Failed
+          type: integer
+          jsonPath: .status.failed
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [workloadRef, storage]
+              properties:
+                workloadRef:
+                  type: object
+                  required: [namespace, name]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [Pod, Job, Deployment, StatefulSet, ReplicaSet]
+                      default: Pod
+                    namespace: { type: string }
+                    name: { type: string }
+                    container: { type: string }
+                action:
+                  type: string
+                  enum: [Checkpoint, Restore]
+                  default: Checkpoint
+                storage:
+                  type: object
+                  required: [type]
+                  properties:
+                    type:
+                      type: string
+                      enum: [hostPath, mount, nfs, pvc, s3]
+                      default: hostPath
+                    path: { type: string }
+                    endpoint: { type: string }
+                    fsType: { type: string }
+                    source: { type: string }
+                    options: { type: string }
+                    subPath: { type: string }
+                    claimName: { type: string }
+                podSelector:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                coordination:
+                  type: string
+                  enum: [None, Barrier]
+                  default: None
+                schedule: { type: string }
+                incremental: { type: boolean, default: false }
+                requireGPU: { type: boolean, default: true }
+                maxConcurrent: { type: integer, format: int32, default: 0 }
+            status:
+              type: object
+              properties:
+                phase: { type: string }
+                observedWorkloadKind: { type: string }
+                total: { type: integer, format: int32 }
+                active: { type: integer, format: int32 }
+                completed: { type: integer, format: int32 }
+                failed: { type: integer, format: int32 }
+                targets:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      podName: { type: string }
+                      node: { type: string }
+                      childName: { type: string }
+                      phase: { type: string }
+                      path: { type: string }
+                      message: { type: string }
+                startTime: { type: string, format: date-time }
+                completionTime: { type: string, format: date-time }
+                message: { type: string }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true

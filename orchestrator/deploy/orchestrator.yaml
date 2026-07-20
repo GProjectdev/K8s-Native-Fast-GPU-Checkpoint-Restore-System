@@ -1,0 +1,95 @@
+# WorkloadCheckpoint orchestrator — a single central controller Deployment.
+# It runs alongside (and independently of) the Node Agent DaemonSet and only
+# CREATES per-Pod GPUCheckpoint objects; it performs no checkpoint work itself.
+# Set `image:` to your registry tag before applying.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-cr-orchestrator
+  namespace: gpu-cr-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpu-cr-orchestrator
+rules:
+  # Own the high-level WorkloadCheckpoint CRs.
+  - apiGroups: ["gpu-cr.io"]
+    resources: ["workloadcheckpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["gpu-cr.io"]
+    resources: ["workloadcheckpoints/status", "workloadcheckpoints/finalizers"]
+    verbs: ["get", "update", "patch"]
+  # Fan out to per-Pod GPUCheckpoint children.
+  - apiGroups: ["gpu-cr.io"]
+    resources: ["gpucheckpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Resolve workloads to their Pods.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  # Leader election.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-cr-orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-cr-orchestrator
+subjects:
+  - kind: ServiceAccount
+    name: gpu-cr-orchestrator
+    namespace: gpu-cr-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-cr-orchestrator
+  namespace: gpu-cr-system
+  labels:
+    app.kubernetes.io/name: gpu-cr-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gpu-cr-orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gpu-cr-orchestrator
+    spec:
+      serviceAccountName: gpu-cr-orchestrator
+      containers:
+        - name: orchestrator
+          image: docker.io/jeongseungjun/gpu-cr-orchestrator:latest
+          imagePullPolicy: Always
+          args:
+            - --leader-elect=true
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+          ports:
+            - name: metrics
+              containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }

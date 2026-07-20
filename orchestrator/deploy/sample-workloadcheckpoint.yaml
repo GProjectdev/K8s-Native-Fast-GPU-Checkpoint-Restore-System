@@ -1,0 +1,24 @@
+# Checkpoint every GPU replica of a Deployment. The orchestrator resolves the
+# Deployment's Pods and creates one GPUCheckpoint per replica; each Node Agent
+# checkpoints its local Pod. Watch progress on the parent's status.
+apiVersion: gpu-cr.io/v1alpha1
+kind: WorkloadCheckpoint
+metadata:
+  name: infer-deploy-ckpt
+  namespace: default
+spec:
+  workloadRef:
+    kind: Deployment
+    namespace: default
+    name: gpu-infer            # your Deployment/StatefulSet/Job/Pod name
+    container: cuda-app        # optional; first container if omitted
+  action: Checkpoint
+  coordination: None           # use Barrier for distributed (NCCL) training
+  requireGPU: true             # only checkpoint Pods requesting nvidia.com/gpu
+  maxConcurrent: 0             # 0 = all at once
+  storage:
+    type: nfs
+    endpoint: "10.178.0.14"
+    source: "10.178.0.14:/mnt/nfs"
+    path: /mnt/nfs
+    subPath: gcr               # controller appends /<pod-name> per replica
