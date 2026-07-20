@@ -78,8 +78,11 @@ type WorkloadCheckpointSpec struct {
 	// +optional
 	Coordination CoordinationPolicy `json:"coordination,omitempty"`
 
-	// Schedule is propagated to each child (Go duration or cron per the child
-	// CRD). Empty means a single one-shot checkpoint.
+	// Schedule is propagated to each child. It accepts a Go duration ("5m",
+	// "1h") or a standard cron expression ("0 */2 * * *", "@hourly"). Empty
+	// means a single one-shot checkpoint. When set, the orchestrator also
+	// periodically re-resolves the workload so new/replaced replicas are
+	// automatically given their own child.
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 

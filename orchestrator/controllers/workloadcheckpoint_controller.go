@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -32,6 +33,11 @@ const (
 	// ownedByLabel ties children back to their parent WorkloadCheckpoint.
 	ownedByLabel = "gpu-cr.io/workload-checkpoint"
 	gpuResource  = corev1.ResourceName("nvidia.com/gpu")
+	// resolveInterval re-resolves a recurring (scheduled) WorkloadCheckpoint's
+	// Pods so new/replaced replicas get their own child.
+	resolveInterval = 30 * time.Second
+	// activePollInterval polls a one-shot fan-out while children are still running.
+	activePollInterval = 15 * time.Second
 )
 
 // WorkloadCheckpointReconciler reconciles WorkloadCheckpoint objects.
@@ -123,6 +129,16 @@ func (r *WorkloadCheckpointReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// (4) Aggregate children into the parent status.
 	if err := r.aggregate(ctx, &wc, pods); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// (5) Requeue to re-resolve Pods so new/replaced replicas are picked up.
+	// Recurring (scheduled) WorkloadCheckpoints poll indefinitely; one-shot ones
+	// poll only while children are still active.
+	if wc.Spec.Schedule != "" {
+		return ctrl.Result{RequeueAfter: resolveInterval}, nil
+	}
+	if wc.Status.Active > 0 {
+		return ctrl.Result{RequeueAfter: activePollInterval}, nil
 	}
 	return ctrl.Result{}, nil
 }

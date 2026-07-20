@@ -66,19 +66,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	period, err := ParseSchedule(cr.Spec.Schedule)
-	if err != nil {
+	// Schedule may be a Go duration ("5m") or a cron expression ("0 */2 * * *").
+	now := time.Now()
+	if _, _, err := NextRun(cr.Spec.Schedule, now); err != nil {
 		return r.fail(ctx, &cr, "invalid schedule: "+err.Error())
 	}
+	recurring := !IsOneShot(cr.Spec.Schedule)
 
 	// Decide whether a checkpoint is due now.
-	now := time.Now()
 	if cr.Status.LastCheckpointTime != nil {
-		if period == 0 {
+		if !recurring {
 			// One-shot already taken: nothing more to do.
 			return ctrl.Result{}, nil
 		}
-		nextDue := cr.Status.LastCheckpointTime.Add(period)
+		nextDue, _, err := NextRun(cr.Spec.Schedule, cr.Status.LastCheckpointTime.Time)
+		if err != nil {
+			return r.fail(ctx, &cr, "invalid schedule: "+err.Error())
+		}
 		if now.Before(nextDue) {
 			return ctrl.Result{RequeueAfter: time.Until(nextDue)}, nil
 		}
@@ -114,12 +118,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	if period == 0 {
+	if !recurring {
 		klog.Infof("one-shot checkpoint completed for %s", req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
-	klog.Infof("periodic checkpoint #%d done for %s; next in %s", cr.Status.CheckpointCount, req.NamespacedName, period)
-	return ctrl.Result{RequeueAfter: period}, nil
+	nextDue, _, _ := NextRun(cr.Spec.Schedule, time.Now())
+	klog.Infof("periodic checkpoint #%d done for %s; next at %s", cr.Status.CheckpointCount, req.NamespacedName, nextDue.Format(time.RFC3339))
+	return ctrl.Result{RequeueAfter: time.Until(nextDue)}, nil
 }
 
 func (r *Reconciler) fail(ctx context.Context, cr *gpucrv1alpha1.GPUCheckpoint, msg string) (ctrl.Result, error) {

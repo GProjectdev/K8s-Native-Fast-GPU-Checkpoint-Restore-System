@@ -90,8 +90,9 @@ type GPUCheckpointSpec struct {
 	// +kubebuilder:validation:Required
 	Storage StorageSpec `json:"storage"`
 
-	// Schedule is the checkpoint interval as a Go duration string
-	// (e.g. "30s", "5m", "1h"). An empty value means a single one-shot checkpoint.
+	// Schedule is the checkpoint cadence. It accepts either a Go duration string
+	// ("30s", "5m", "1h") or a standard cron expression ("0 */2 * * *",
+	// "@hourly"). An empty value means a single one-shot checkpoint.
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 

@@ -16,6 +16,8 @@ spec:
   coordination: None           # use Barrier for distributed (NCCL) training
   requireGPU: true             # only checkpoint Pods requesting nvidia.com/gpu
   maxConcurrent: 0             # 0 = all at once
+  # schedule: "1h"             # Go duration OR cron, e.g. "0 */2 * * *" / "@hourly"
+  #                            # (recurring: new replicas are auto-added)
   storage:
     type: nfs
     endpoint: "10.178.0.14"
