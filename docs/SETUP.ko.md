@@ -10,7 +10,8 @@ CPU**는 **kubelet Checkpoint API → CRI-O → CRIU + NVIDIA cuda_plugin**(CRIU
 `GPUCheckpoint` CR을 만들면, 대상 노드의 Node Agent가:
 1. **인터셉터**가 GPU 데이터 버퍼를 host로 복사 + 물리해제(VA 보존)  [Selective Interception]
 2. **kubelet Checkpoint API** → CRI-O/CRIU + **cuda_plugin** 이 남은 GPU control state + CPU를 tar로  [CRIUgpu]
-3. 그 tar를 CR `.spec.storage.path`로 저장 → 인터셉터가 데이터 remap(복귀)
+3. 인터셉터가 데이터 remap(복귀, resume) → **tar + blob** 둘 다 저장 (완전한 체크포인트).
+   `GCR_INTERCEPTION=false`면 blob 없이 baseline CRIUgpu로만 동작.
 
 > 전제: **NVIDIA 드라이버 570+** (cuda-checkpoint가 `/dev/nvidia*` fd까지 release해야 CRIU 성공),
 > **CRIU cuda_plugin 설치/활성화**, 단일 300GB 부팅 디스크.
@@ -55,13 +56,14 @@ kubectl get pod cuda-sample-pod -o wide -w             # Running
 kubectl apply -f deploy/sample-gpucheckpoint.yaml      # GPUCheckpoint CR
 kubectl get gpucheckpoints.gpu-cr.io -w                # Checkpointing -> Completed
 ```
+> Deployment/StatefulSet/Job 단위로 하려면 WorkloadCheckpoint 오케스트레이터(`orchestrator/`) 사용.
 
 ## 7. 검증
 ```bash
 kubectl -n gpu-cr-system logs -l app.kubernetes.io/name=gpu-cr-node-agent | tail
-ls -lh /var/lib/gcr-checkpoint/                        # checkpoint-*.tar
+ls -lh /var/lib/gcr-checkpoint/                        # checkpoint-*.tar + checkpoint-*.blob
 ```
-통과 = GPUCheckpoint `Completed` + tar 생성. (CRIUgpu가 실패하면 워커의
+통과 = GPUCheckpoint `Completed` + **tar + blob** 생성(interception 켜진 경우). (CRIUgpu가 실패하면 워커의
 `/var/lib/containers/storage/overlay-containers/<id>/userdata/dump.log` 확인.)
 
 ## 8. GPUCheckpoint CR 스키마
@@ -72,15 +74,15 @@ kind: GPUCheckpoint
 metadata: { name: ckpt-sample-001, namespace: default }
 spec:
   workloadRef:                # (기존 podRef 확장) 대상 워크로드
-    kind: Pod                 # Pod (기본) | Deployment | StatefulSet(예약)
+    kind: Pod                 # Pod 전용 (멀티 replica는 WorkloadCheckpoint / orchestrator)
     namespace: default
     name: cuda-sample-pod
     container: cuda-app       # 생략 시 첫 컨테이너
     nodeInfo: ""              # 생략 시 Pod의 spec.nodeName 으로 해석
   storage:
-    type: hostPath            # hostPath | nfs | s3
+    type: hostPath            # hostPath | mount | nfs | pvc | s3
     path: /var/lib/gcr-checkpoint
-  schedule: ""                # (기존 period 대체) 빈 값=one-shot, "5m"/"1h"=주기 (Go duration)
+  schedule: ""                # 빈 값=one-shot; Go duration("5m","1h") 또는 cron("0 */2 * * *")
 status:                       # CRD에 정의됨 (agent가 갱신)
   phase: Completed            # Pending|Checkpointing|Completed|Failed
   observedNode: ...
@@ -93,7 +95,11 @@ status:                       # CRD에 정의됨 (agent가 갱신)
 ## 9. 트러블슈팅
 | 증상 | 조치 |
 |---|---|
-| CRIU 실패 `chr 195` / `-52` | 드라이버 **570+** 필요 |
+| CRIU 실패 `chr 195` | 드라이버 **570+** 필요 (cuda-checkpoint가 `/dev/nvidia*` fd 해제) |
+| CRIU 덤프 `-52` (Connected TCP socket) | 살아있는 TCP 소켓(HF keep-alive 등). `quickstart`가 `/etc/criu/default.conf`에 `tcp-close`/`ext-unix-sk`/`file-locks` 기록 |
 | dump.log `cuda_plugin` 관련 실패 | CRIU cuda_plugin 미설치/버전 → 설치 확인 (`cuda_plugin.so`) |
+| `.tar`만 있고 `.blob` 없음 | `GCR_INTERCEPTION=false`(baseline)이거나, 체크포인트 시 Pod가 `READY` 아님 / 그 노드에 인터셉터 미마운트 |
 | DaemonSet DESIRED=0 / Cilium not ready | nvidia-container-runtime crun 미위임 → 스크립트가 보정 |
-| checkpoint API 404 | kubelet `ContainerCheckpoint` feature gate |
+| checkpoint API 404 / DeadlineExceeded | kubelet `ContainerCheckpoint` 게이트 + `--runtime-request-timeout=30m`, agent `--kubelet-timeout=30m` |
+| 복원 시 `could not load libcriu.so.2` | crun/CRIU 불일치 — CRIU 4.2엔 **crun 1.26**(1.20 아님) |
+| 오프라인 모델 tokenizer/`config.json` 오류 | 로컬 모델 dir에 가중치+`config.json`+tokenizer 파일+샤드 `*.index.json` 전부, Pod에 `sentencepiece tiktoken protobuf` |

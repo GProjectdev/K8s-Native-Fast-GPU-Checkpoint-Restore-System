@@ -1,6 +1,6 @@
 # One-off Job: download facebook/opt-1.3b into the NFS share so GPU pods can load it
 # locally (no runtime HuggingFace dependency). Runs in a small python container that
-# mounts 10.178.0.15:/mnt/nfs and writes to /mnt/nfs/models/opt-1.3b. No host installs.
+# mounts 10.178.0.14:/mnt/nfs and writes to /mnt/nfs/models/opt-1.3b. No host installs.
 #
 # HF's public Xet CDN currently 403s, so a token is needed:
 #   kubectl create secret generic hf-token -n default --from-literal=token=hf_xxxx   # only if public 403s
@@ -45,4 +45,4 @@ spec:
             - { name: nfs, mountPath: /out }
       volumes:
         - name: nfs
-          nfs: { server: 10.178.0.15, path: /mnt/nfs }
+          nfs: { server: 10.178.0.14, path: /mnt/nfs }

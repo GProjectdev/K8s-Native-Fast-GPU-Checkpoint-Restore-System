@@ -64,7 +64,7 @@ type StorageSpec struct {
 	// FsType is the filesystem type passed to mount(8): nfs, nfs4, cifs, ceph, etc.
 	// +optional
 	FsType string `json:"fsType,omitempty"`
-	// Source is the mount source, e.g. "10.178.0.15:/mnt/nfs", "fs-xxxx.efs.region.amazonaws.com:/", "//host/share".
+	// Source is the mount source, e.g. "10.178.0.14:/mnt/nfs", "fs-xxxx.efs.region.amazonaws.com:/", "//host/share".
 	// +optional
 	Source string `json:"source,omitempty"`
 	// Options are comma-separated mount -o options (e.g. "nfsvers=4,nolock").

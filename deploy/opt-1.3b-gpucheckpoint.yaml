@@ -21,7 +21,7 @@ spec:
     container: cuda-app
   storage:
     type: nfs
-    endpoint: 10.178.0.15
+    endpoint: 10.178.0.14
     path: /mnt/nfs
     subPath: gcr
   schedule: ""        # one-shot

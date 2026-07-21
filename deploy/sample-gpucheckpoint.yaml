@@ -24,14 +24,14 @@ spec:
     #            NFS, AWS EFS, CIFS/SMB, CephFS, GlusterFS, ...
     #   type: mount
     #   fsType: nfs4                # or cifs, ceph, glusterfs, ...
-    #   source: 10.178.0.15:/mnt/nfs
+    #   source: 10.178.0.14:/mnt/nfs
     #   options: "nfsvers=4,nolock" # mount -o options (optional)
     #   subPath: gcr                # optional subdir under the mount
     #   # AWS EFS example:  fsType: nfs4  source: fs-abc123.efs.ap-northeast-3.amazonaws.com:/
     #
     # nfs      : shorthand for `mount` with fsType=nfs.
     #   type: nfs
-    #   endpoint: 10.178.0.15
+    #   endpoint: 10.178.0.14
     #   path: /mnt/nfs
     #
     # pvc      : CSI-backed claim (e.g. AWS EBS block volumes). Requires the

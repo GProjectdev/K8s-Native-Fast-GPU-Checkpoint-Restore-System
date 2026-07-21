@@ -1,13 +1,13 @@
 # Pre-download the benchmark PyTorch models into the NFS share so run.sh can load them
 # locally (MODELS_NFS=...), avoiding HuggingFace's flaky Xet CDN at benchmark time.
-# Writes to 10.178.0.15:/mnt/nfs/models/<model-id>.
+# Writes to 10.178.0.14:/mnt/nfs/models/<model-id>.
 #
 #   # optional (public Xet often 403s): kubectl create secret generic hf-token -n default --from-literal=token=hf_xxx
 #   kubectl apply -f benchmark/download-models-job.yaml
 #   kubectl logs -f job/hf-download-bench-models
 #   # then run the benchmark against the cache:
-#   MODELS_NFS=10.178.0.15:/mnt/nfs/models FRAMEWORKS=pytorch MODES="gcr baseline" RUNS=3 \
-#     STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
+#   MODELS_NFS=10.178.0.14:/mnt/nfs/models FRAMEWORKS=pytorch MODES="gcr baseline" RUNS=3 \
+#     STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.14 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
 #     bash benchmark/run.sh
 apiVersion: batch/v1
 kind: Job
@@ -53,4 +53,4 @@ spec:
             - { name: nfs, mountPath: /out }
       volumes:
         - name: nfs
-          nfs: { server: 10.178.0.15, path: /mnt/nfs }
+          nfs: { server: 10.178.0.14, path: /mnt/nfs }

@@ -114,11 +114,11 @@ so you can benchmark any backend without editing files:
 bash benchmark/run.sh
 
 # NFS (agent mounts it at runtime; no DaemonSet volume needed)
-STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
+STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.14 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
   MODES="gcr baseline" bash benchmark/run.sh
 
 # generic file mount (NFSv4 / EFS / CIFS / CephFS ...)
-STORAGE_TYPE=mount STORAGE_FSTYPE=nfs4 STORAGE_SOURCE=10.178.0.15:/mnt/nfs \
+STORAGE_TYPE=mount STORAGE_FSTYPE=nfs4 STORAGE_SOURCE=10.178.0.14:/mnt/nfs \
   STORAGE_OPTIONS=nfsvers=4,nolock STORAGE_SUBPATH=gcr bash benchmark/run.sh
 
 # CSI/PVC (EBS, EFS, ...) — needs the checkpoint mover (pending)
@@ -168,7 +168,7 @@ Run one model, gcr vs baseline, keeping resources on failure:
 ONLY="pytorch gpt2-large" MODES="gcr baseline" KEEP_FAILED=1 TIMEOUT=1800   bash benchmark/run.sh
 
 # or straight to NFS:
-STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr ONLY="pytorch gpt2-large" MODES="gcr baseline" KEEP_FAILED=1 TIMEOUT=1800   bash benchmark/run.sh
+STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.14 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr ONLY="pytorch gpt2-large" MODES="gcr baseline" KEEP_FAILED=1 TIMEOUT=1800   bash benchmark/run.sh
 ```
 
 Success = in the CSV, **`gcr` `tar_bytes` is ~model-size smaller than `baseline`**
@@ -186,15 +186,22 @@ the PyTorch models into the NFS share once, then load them locally:
 # (optional, if public Xet 403s) create an HF token secret:
 kubectl create secret generic hf-token -n default --from-literal=token=hf_xxx
 
-# 1) download gpt2, gpt2-large, opt-1.3b, opt-6.7b into 10.178.0.15:/mnt/nfs/models/<id>
+# 1) download gpt2, gpt2-large, opt-1.3b, opt-6.7b into 10.178.0.14:/mnt/nfs/models/<id>
 kubectl apply -f benchmark/download-models-job.yaml
 kubectl logs -f job/hf-download-bench-models      # wait for "all models cached"
 
 # 2) run the benchmark against the cache (MODELS_NFS -> load from /models/<id> offline)
-MODELS_NFS=10.178.0.15:/mnt/nfs/models FRAMEWORKS=pytorch MODES="gcr baseline" RUNS=3 \
-  STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.15 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
+MODELS_NFS=10.178.0.14:/mnt/nfs/models FRAMEWORKS=pytorch MODES="gcr baseline" RUNS=3 \
+  STORAGE_TYPE=nfs STORAGE_ENDPOINT=10.178.0.14 STORAGE_PATH=/mnt/nfs STORAGE_SUBPATH=gcr \
   bash benchmark/run.sh
 ```
 `MODELS_NFS` mounts the NFS models dir into each PyTorch pod and sets `MODEL=/models/<id>`
 with `HF_HUB_OFFLINE=1`/`TRANSFORMERS_OFFLINE=1` — no runtime HuggingFace access.
 (TensorFlow models are unaffected; they use keras.applications, not HF.)
+
+> The cached model dir must contain **all** files, not just weights: `config.json`,
+> tokenizer files (`tokenizer.json` or `vocab.json`+`merges.txt`, `tokenizer_config.json`),
+> and for sharded models the `*.index.json`. If a tokenizer/config file is missing you'll
+> see `Couldn't instantiate the backend tokenizer` or `no file named model.safetensors`;
+> fetch the missing small files (e.g. `curl -fsSL https://huggingface.co/<id>/resolve/main/<file>`).
+> The pods install `sentencepiece tiktoken protobuf` for tokenizer conversion.

@@ -15,8 +15,9 @@ the GCR paper (thustorage/GCR).
 - **remap** (on resume): recreate physical + map the same VA + copy H2D from the blob.
 
 This mirrors GCR: their offload target is `/mnt/huge` hugepage shared memory; ours is
-`GCR_DATA_DIR`. Put `GCR_DATA_DIR` on **tmpfs (RAM)** for the paper's speed — the
-benchmark mounts it as an `emptyDir{medium: Memory}`.
+`GCR_DATA_DIR`. The blob must be on a **host-visible** dir so the agent can persist it
+next to the tar; the benchmark/samples use a hostPath **`/var/lib/gcr-data`**. For the
+paper's speed, mount that path on **tmpfs (RAM)** on the node.
 
 ## Overlapped copy engine (freeze/remap)
 freeze/remap copy GPU<->blob with a GCR-style pipeline: **pinned double-buffer + async
@@ -35,9 +36,11 @@ blob, the tar is smaller and the cuda_plugin GPU dump is cheap.
 1. **Tar shrinks**: the `gcr` tar should now be ~model-size smaller than `baseline`
    (previously they were identical). Compare `tar_bytes` in the benchmark CSV.
 2. **CRIU excludes the blob**: if CRIU errors on the `data.blob` mapping or still
-   dumps it, the `GCR_DATA_DIR` mount may need to be treated as external. Options:
-   `emptyDir{medium:Memory}` (default in the benchmark), a tmpfs hostPath, or a CRIU
-   `--external`/ext-mount mapping. Check `dump.log` and the tar size.
+   dumps it, the `GCR_DATA_DIR` mount may need to be treated as external. The agent
+   `munmap`s + closes the blob before the dump so CRIU can't serialize it; if needed,
+   use a tmpfs hostPath or a CRIU `--external`/ext-mount mapping. Check `dump.log` and
+   the tar size. (Note: `GCR_DATA_DIR` must be a **host-visible hostPath**, not an
+   `emptyDir`, so the agent can copy the blob to storage.)
 3. **Bandwidth**: freeze `bytes/time` should approach PCIe (pinned staging) vs the
    old ~1.2 GB/s pageable copy.
 

@@ -20,13 +20,13 @@ KEEP_FAILED=${KEEP_FAILED:-0}
 PRECLEAN_GPU=${PRECLEAN_GPU:-0}
 GCR_SKIP_FW=${GCR_SKIP_FW:-}   # frameworks to skip in gcr mode (interceptor unsupported), e.g. "tensorflow"
 RUNS=${RUNS:-3}                # repeats per (mode,config) for median stats
-MODELS_NFS=${MODELS_NFS:-}      # "server:/path" e.g. 10.178.0.15:/mnt/nfs/models -> load PyTorch models locally (no HF download)
+MODELS_NFS=${MODELS_NFS:-}      # "server:/path" e.g. 10.178.0.14:/mnt/nfs/models -> load PyTorch models locally (no HF download)
 # --- checkpoint storage backend (mirrors spec.storage) ---
 STORAGE_TYPE=${STORAGE_TYPE:-hostPath}     # hostPath | mount | nfs | pvc
 STORAGE_PATH=${STORAGE_PATH:-/var/lib/gcr-checkpoint}   # hostPath dir, or subdir for mount/pvc
 STORAGE_ENDPOINT=${STORAGE_ENDPOINT:-}     # nfs server
 STORAGE_FSTYPE=${STORAGE_FSTYPE:-}         # mount fsType: nfs4|cifs|ceph|...
-STORAGE_SOURCE=${STORAGE_SOURCE:-}         # mount source, e.g. 10.178.0.15:/mnt/nfs
+STORAGE_SOURCE=${STORAGE_SOURCE:-}         # mount source, e.g. 10.178.0.14:/mnt/nfs
 STORAGE_OPTIONS=${STORAGE_OPTIONS:-}       # mount -o options
 STORAGE_SUBPATH=${STORAGE_SUBPATH:-}       # subdir under the backend
 STORAGE_CLAIM=${STORAGE_CLAIM:-}           # pvc claimName
